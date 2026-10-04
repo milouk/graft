@@ -53,7 +53,7 @@ MUTATIONS = [
     ("debug registers: DR0 not restored", "port/nvmm_port_x86.h",
      "\tx86_set_dr0(pc->dr[0]);\n\tx86_set_dr1(pc->dr[1]);", "\tx86_set_dr1(pc->dr[1]);"),
     ("sleep/wake: vCPU allowed to run while suspended", "src/x86/nvmm_x86_svm.c",
-     "\t\tif (__predict_false(svm_suspended)) {", "\t\tif (0) {"),
+     "\t\t\tif (__predict_false(svm_suspended)) {", "\t\t\tif (0) {"),
     ("sleep/wake: SVM not re-enabled on resume", "src/x86/nvmm_x86_svm.c",
      "\tos_ipi_broadcast(svm_change_cpu, (void *)true);\n\tsvm_suspended = false;",
      "\tsvm_suspended = false;"),

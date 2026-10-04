@@ -504,6 +504,22 @@ static struct svm_hsave *hsave;
 static struct svm_hsave *svm_hostvmcb;
 /* Set while the host has SVM switched off around sleep. */
 static volatile bool svm_suspended;
+
+static inline uint64_t
+svm_port_intr_disable(void)
+{
+	uint64_t rflags;
+
+	__asm volatile ("pushfq; popq %0; cli" : "=r" (rflags) : : "memory");
+	return rflags;
+}
+
+static inline void
+svm_port_intr_restore(uint64_t rflags)
+{
+	if (rflags & PSL_I)
+		__asm volatile ("sti" ::: "memory");
+}
 #endif
 
 static uint8_t *svm_asidmap __read_mostly;
@@ -1793,17 +1809,29 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 			svm_vmcb_cache_flush(vmcb, VMCB_CTRL_VMCB_CLEAN_I);
 		}
 
-		svm_clgi();
-		machgen = svm_htlb_flush(mach, cpudata);
-
 #if defined(NVMM_PORT)
-		if (__predict_false(svm_suspended)) {
-			/* No hTLB flush ack, because it's not executed. */
-			svm_stgi();
-			exit->reason = NVMM_VCPU_EXIT_NONE;
-			break;
+		/*
+		 * While the host has SVM switched off for sleep, CLGI, VMRUN
+		 * and STGI are all illegal instructions, so the check has to
+		 * come before the first of them. Interrupts are held off from
+		 * the check until CLGI takes over, so the suspend IPI cannot
+		 * slip in between; see nvmm_port_suspend().
+		 */
+		{
+			const uint64_t rflags = svm_port_intr_disable();
+
+			if (__predict_false(svm_suspended)) {
+				svm_port_intr_restore(rflags);
+				exit->reason = NVMM_VCPU_EXIT_NONE;
+				break;
+			}
+			svm_clgi();
+			svm_port_intr_restore(rflags);
 		}
+#else
+		svm_clgi();
 #endif
+		machgen = svm_htlb_flush(mach, cpudata);
 
 #ifdef __DragonFly__
 		/*
@@ -2993,10 +3021,11 @@ void
 nvmm_port_suspend(void)
 {
 	/*
-	 * Raise the flag first. A vCPU loop checks it with GIF clear, so it
-	 * either sees the flag and backs out, or is already committed to a
-	 * VMRUN that the broadcast below immediately interrupts; either way it
-	 * never executes VMRUN with SVM switched off.
+	 * Raise the flag first. A vCPU loop checks it with interrupts off and
+	 * keeps them off until CLGI, so it either sees the flag and backs out,
+	 * or is already committed to a VMRUN that the broadcast below
+	 * interrupts at once, before SVM is switched off on that CPU. The
+	 * next trip round the loop then sees the flag.
 	 */
 	svm_suspended = true;
 	os_ipi_broadcast(svm_change_cpu, (void *)false);
