@@ -299,6 +299,12 @@ mem_build_parts(struct port_membuf *buf, size_t size)
 	nvmm_darwin_mem_stats.last_wanted = (unsigned int)(size / NVMM_LARGE);
 	nvmm_darwin_mem_stats.last_usec =
 	    (unsigned int)((mem_now_ns() - t0) / 1000);
+	if (size >= (64ULL << 20)) {
+		printf("nvmm: %zu MB of guest memory: %u of %u 2M runs, "
+		    "%u ms\n", size >> 20, nlarge,
+		    nvmm_darwin_mem_stats.last_wanted,
+		    nvmm_darwin_mem_stats.last_usec / 1000);
+	}
 
 	if (nlarge == 0) {
 		IOFree(parts, cap * sizeof(*parts));
@@ -353,10 +359,13 @@ port_membuf_create(size_t size)
 
 	plain = mem_plain(rounded);
 	if (plain == NULL) {
+		printf("nvmm: cannot allocate %zu bytes of wired memory\n",
+		    rounded);
 		IOFree(buf, sizeof(*buf));
 		return NULL;
 	}
 	if (plain->prepare() != kIOReturnSuccess) {
+		printf("nvmm: cannot wire %zu bytes of memory\n", rounded);
 		plain->release();
 		IOFree(buf, sizeof(*buf));
 		return NULL;

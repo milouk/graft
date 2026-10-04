@@ -2,11 +2,12 @@
 #
 # bootstrap-deps.sh — get what QEMU needs to build, without a package manager.
 #
-# QEMU's build needs Python 3.9 or newer (macOS ships one with the command
-# line tools), ninja, pkg-config, glib and libslirp. Homebrew no longer installs on
-# x86_64 Macs, and MacPorts compiles some eighty packages from source to
-# provide them. So: ninja, meson and pkg-config come as ready-made Python
-# wheels, and glib and libslirp are built from source, in a few minutes.
+# QEMU's build needs Python (3.9 or newer for current QEMU, 3.7 for QEMU 7.2;
+# macOS ships one with the command line tools), ninja, pkg-config, glib,
+# pixman and libslirp. Homebrew no longer installs on x86_64 Macs, and MacPorts
+# compiles some eighty packages from source to provide them. So: ninja, meson
+# and pkg-config come as ready-made Python wheels, and the three libraries
+# are built from source, in a few minutes.
 #
 # Everything lands under <build dir>/deps; nothing is installed system-wide.
 #
@@ -18,6 +19,7 @@ set -eu
 GLIB_SERIES=2.88
 GLIB_VERSION=2.88.3
 SLIRP_VERSION=4.9.5
+PIXMAN_VERSION=0.42.2
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD=${NVMM_BUILD_DIR:-"$ROOT/build"}
@@ -31,8 +33,8 @@ if [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 PYTHON=${PYTHON:-/usr/bin/python3}
-"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || {
-	echo "ERROR: $PYTHON is older than 3.9. Install the Xcode command line" >&2
+"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' || {
+	echo "ERROR: $PYTHON is older than 3.7. Install the Xcode command line" >&2
 	echo "tools (xcode-select --install) or set PYTHON=/path/to/python3." >&2
 	exit 1
 }
@@ -41,8 +43,14 @@ mkdir -p "$DEPS"
 
 # tomli is for QEMU's own configure step: Python 3.9 has no built-in TOML
 # parser, and QEMU's build reads a TOML file.
+# (The pkgconf module itself does not import on Python 3.7; only the binary
+# inside the wheel is used, so look for that.)
+find_pkgconf() {
+	find "$VENV" -path '*pkgconf/.bin/pkgconf' -type f 2>/dev/null | head -1
+}
 if [ ! -x "$VENV/bin/ninja" ] || [ ! -x "$VENV/bin/meson" ] ||
-    ! "$VENV/bin/python" -c 'import tomli, packaging, pkgconf' 2>/dev/null; then
+    [ -z "$(find_pkgconf)" ] ||
+    ! "$VENV/bin/python" -c 'import tomli, packaging' 2>/dev/null; then
 	echo "==> build tools (meson, ninja, pkg-config)"
 	"$PYTHON" -m venv "$VENV"
 	"$VENV/bin/python" -m pip install -q --upgrade pip
@@ -50,8 +58,8 @@ if [ ! -x "$VENV/bin/ninja" ] || [ ! -x "$VENV/bin/meson" ] ||
 fi
 
 # The wheel ships the real pkgconf binary next to a chatty Python wrapper.
-PKGCONF=$("$VENV/bin/python" -c 'import pkgconf, os; print(os.path.join(os.path.dirname(pkgconf.__file__), ".bin", "pkgconf"))')
-[ -x "$PKGCONF" ] || { echo "ERROR: pkgconf binary not found in the wheel" >&2; exit 1; }
+PKGCONF=$(find_pkgconf)
+[ -n "$PKGCONF" ] && [ -x "$PKGCONF" ] || { echo "ERROR: pkgconf binary not found in the wheel" >&2; exit 1; }
 ln -sf "$PKGCONF" "$VENV/bin/pkg-config-real"
 
 if [ ! -f "$PREFIX/lib/pkgconfig/glib-2.0.pc" ]; then
@@ -138,9 +146,44 @@ if [ ! -f "$PREFIX/lib/pkgconfig/slirp.pc" ]; then
 	}
 fi
 
+# pixman is QEMU's pixel library. Current QEMU can be built without it, but
+# QEMU before 8.2 cannot, and it is small.
+if [ ! -f "$PREFIX/lib/pkgconfig/pixman-1.pc" ]; then
+	TARBALL="$DEPS/pixman-$PIXMAN_VERSION.tar.gz"
+	if [ ! -f "$TARBALL" ]; then
+		echo "==> downloading pixman $PIXMAN_VERSION"
+		curl -fsSL --retry 3 -o "$TARBALL.part" \
+		    "https://www.cairographics.org/releases/pixman-$PIXMAN_VERSION.tar.gz"
+		mv "$TARBALL.part" "$TARBALL"
+	fi
+	rm -rf "$DEPS/pixman-$PIXMAN_VERSION"
+	tar -xf "$TARBALL" -C "$DEPS"
+
+	echo "==> building pixman"
+	cd "$DEPS/pixman-$PIXMAN_VERSION"
+	PATH="$VENV/bin:$PATH" PKG_CONFIG="$VENV/bin/pkg-config-real" \
+	PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+	    "$VENV/bin/meson" setup _build \
+	    --prefix="$PREFIX" --libdir=lib --buildtype=release \
+	    -Dtests=disabled -Dgtk=disabled -Dlibpng=disabled \
+	    -Dopenmp=disabled \
+	    > "$DEPS/pixman-setup.log" 2>&1 || {
+		tail -25 "$DEPS/pixman-setup.log" >&2
+		echo "ERROR: pixman configure failed; see $DEPS/pixman-setup.log" >&2
+		exit 1
+	}
+	PATH="$VENV/bin:$PATH" "$VENV/bin/ninja" -C _build install \
+	    > "$DEPS/pixman-build.log" 2>&1 || {
+		grep -E "error:|FAILED" "$DEPS/pixman-build.log" | head -20 >&2
+		echo "ERROR: pixman build failed; see $DEPS/pixman-build.log" >&2
+		exit 1
+	}
+fi
+
 echo "==> ready"
 echo "    ninja       $("$VENV/bin/ninja" --version)"
 echo "    meson       $("$VENV/bin/meson" --version)"
 echo "    pkg-config  $("$VENV/bin/pkg-config-real" --version)"
 echo "    glib        $(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$VENV/bin/pkg-config-real" --modversion glib-2.0)"
+echo "    pixman      $(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$VENV/bin/pkg-config-real" --modversion pixman-1)"
 echo "    libslirp    $(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$VENV/bin/pkg-config-real" --modversion slirp)"

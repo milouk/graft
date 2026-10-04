@@ -10,7 +10,11 @@
 # command line tools: QEMU's other dependencies are fetched and built by
 # tools/bootstrap-deps.sh, which this script runs if they are missing.
 #
-# Usage:  ./tools/build-qemu.sh [qemu-version]      default: 11.1.2
+# Usage:  ./tools/build-qemu.sh [qemu-version]
+#
+# The default version is 11.1.2 on macOS 12 and later. Older systems get
+# 7.2.22, the last series that builds with their compiler and Python; it has
+# booted Linux under this driver on macOS 10.15.
 #         NVMM_BUILD_DIR=/some/dir ./tools/build-qemu.sh
 #
 # Everything is built under the build directory; nothing is installed
@@ -18,7 +22,14 @@
 #
 set -eu
 
-VERSION=${1:-11.1.2}
+OS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+if [ "$OS_MAJOR" -ge 12 ]; then
+	DEFAULT_VERSION=11.1.2
+else
+	DEFAULT_VERSION=7.2.22
+fi
+VERSION=${1:-$DEFAULT_VERSION}
+QEMU_MAJOR=${VERSION%%.*}
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD=${NVMM_BUILD_DIR:-"$ROOT/build"}
 DEPS="$BUILD/deps"
@@ -47,8 +58,8 @@ PKG_CONFIG_PATH="$DEPS/prefix/lib/pkgconfig"
 export PKG_CONFIG_PATH
 
 echo "==> libnvmm"
-make -C "$ROOT" libnvmm >/dev/null
-[ -f "$ROOT/build/libnvmm.a" ] || { echo "ERROR: libnvmm did not build" >&2; exit 1; }
+make -C "$ROOT" BUILD="$BUILD" libnvmm >/dev/null
+[ -f "$BUILD/libnvmm.a" ] || { echo "ERROR: libnvmm did not build" >&2; exit 1; }
 
 mkdir -p "$WORK"
 if [ ! -f "$TARBALL" ]; then
@@ -68,13 +79,18 @@ python3 - "$SRC/meson.build" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path).read()
-old = "if host_os == 'netbsd'\n  nvmm = cc.find_library('nvmm'"
-new = "if host_os == 'netbsd' or host_os == 'darwin'\n  nvmm = cc.find_library('nvmm'"
-if new in src:
-    print("    already patched")
-elif src.count(old) == 1:
-    open(path, "w").write(src.replace(old, new))
-    print("    patched meson.build")
+# The variable holding the host OS was renamed from targetos to host_os in 9.0.
+for var in ("host_os", "targetos"):
+    old = "if %s == 'netbsd'\n  nvmm = cc.find_library('nvmm'" % var
+    new = ("if %s == 'netbsd' or %s == 'darwin'\n"
+           "  nvmm = cc.find_library('nvmm'" % (var, var))
+    if new in src:
+        print("    already patched")
+        break
+    if src.count(old) == 1:
+        open(path, "w").write(src.replace(old, new))
+        print("    patched meson.build")
+        break
 else:
     sys.exit("ERROR: the nvmm check in meson.build does not look as expected "
              "for this QEMU version; patch it by hand.")
@@ -83,24 +99,31 @@ PY
 echo "==> configuring"
 mkdir -p "$SRC/build"
 cd "$SRC/build"
-# pixman is only needed for graphical output, which a container host has no
-# use for. The crypto libraries are optional too: QEMU falls back to its own
-# implementations.
+# No graphical output: a container host has no use for it. Current QEMU can
+# then do without pixman altogether; QEMU 7 cannot, and is told to leave the
+# Cocoa window and the disassembler out instead. The crypto libraries are
+# optional: QEMU falls back to its own implementations.
+if [ "$QEMU_MAJOR" -ge 9 ]; then
+	DISPLAY_FLAGS="--disable-pixman"
+else
+	DISPLAY_FLAGS="--disable-cocoa --disable-capstone"
+fi
+# shellcheck disable=SC2086
 ../configure \
     --python="$DEPS/venv/bin/python" \
     --ninja="$DEPS/venv/bin/ninja" \
     --target-list=x86_64-softmmu \
     --enable-nvmm \
     --enable-slirp \
-    --disable-pixman \
+    $DISPLAY_FLAGS \
     --disable-gcrypt \
     --disable-gnutls \
     --disable-nettle \
     --disable-docs \
     --disable-guest-agent \
     --disable-werror \
-    --extra-cflags="-I$ROOT/build/include" \
-    --extra-ldflags="-L$ROOT/build" \
+    --extra-cflags="-I$BUILD/include" \
+    --extra-ldflags="-L$BUILD" \
     > configure.log 2>&1 || {
 	tail -30 configure.log >&2
 	echo "ERROR: configure failed; full log in $SRC/build/configure.log" >&2
