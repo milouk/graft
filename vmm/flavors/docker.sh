@@ -1,0 +1,20 @@
+# docker — the Docker daemon. Its client and plugins are not installed: they
+# run on the host, which reaches the daemon through its socket.
+
+FLAVOR_PKGS="docker-engine docker-openrc"	# installed in the image
+FLAVOR_BUILD_PKGS="docker"			# needed while building, to pull
+FLAVOR_SERVICE=docker				# started at boot
+FLAVOR_SOCKET=/var/run/docker.sock		# what the host is given, if anything
+FLAVOR_CLI=					# what is run inside the VM, if anything
+
+flavor_setup() { :; }
+
+# Pull the images named into the store of the image being built, at /mnt.
+flavor_pull() {
+	dockerd --data-root /mnt/var/lib/docker > /tmp/daemon.log 2>&1 &
+	for i in $(seq 60); do docker info > /dev/null 2>&1 && break; sleep 2; done
+	docker info > /dev/null
+	for img in "$@"; do docker pull -q "$img"; done
+	kill "$(pidof dockerd)"
+	for i in $(seq 30); do pidof dockerd > /dev/null || break; sleep 1; done
+}
