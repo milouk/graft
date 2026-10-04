@@ -12,13 +12,15 @@
  * its command line, which is how virtio's memory-mapped transport is used
  * on machines with no firmware tables to describe it.
  *
- * A network card, if asked for (-n), is a virtio one on macOS's own vmnet:
- * the guest gets an address by DHCP and reaches the outside through the
- * host, with nothing to configure. vmnet needs root.
+ * A network card, if asked for, is a virtio one. Its frames go either to
+ * macOS's own vmnet (-n vmnet, needs root) or over a socket to a helper
+ * that does the networking in userland (-n /path/to/socket; see the comment
+ * on the socket backend below). Either way the guest gets its address by
+ * DHCP and a route out, with nothing to configure.
  *
  * Usage (needs /dev/nvmm):
- *   nvmm-run -k vmlinuz [-i initramfs] [-d disk.img] [-n] [-m megabytes]
- *            [-a "extra cmdline"]
+ *   nvmm-run -k vmlinuz [-i initramfs] [-d disk.img] [-n vmnet|socket]
+ *            [-m megabytes] [-a "extra cmdline"]
  *
  * The console is this terminal. Ctrl-A then x quits.
  */
@@ -26,8 +28,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -646,8 +650,7 @@ struct virtio_dev {
 	uint8_t config[64];
 	void (*notify)(struct virtio_dev *, unsigned int);
 	int fd;				/* block: the image */
-	interface_ref iface;		/* network: the vmnet interface */
-	size_t max_packet;
+	size_t max_packet;		/* network: largest frame */
 };
 
 static struct virtio_dev vdevs[VIRTIO_MAXDEV];
@@ -937,8 +940,20 @@ blk_add(const char *path, char *cmdline, size_t cmdlen)
 #define NET_HDR_LEN		12	/* struct virtio_net_hdr_v1 */
 #define NET_RXQ			0
 #define NET_TXQ			1
+#define NET_FRAME_MAX		65536
+
+/*
+ * What carries the card's frames. Two are provided: macOS's vmnet, and a
+ * stream socket to a helper process that does the networking in userland.
+ * 'recv' must not block: it returns 0 when nothing is waiting.
+ */
+struct net_backend {
+	void (*send)(const uint8_t *, size_t);
+	size_t (*recv)(uint8_t *, size_t);
+};
 
 static struct virtio_dev *netdev;
+static struct net_backend net_be;
 static volatile bool net_rx_ready;
 
 /* Guest to host: each request is a header and one frame. */
@@ -946,17 +961,14 @@ static void
 net_tx(struct virtio_dev *d)
 {
 	static struct iovec iov[VQ_IOV_MAX];
-	static uint8_t frame[65536];
+	static uint8_t frame[NET_FRAME_MAX];
 	struct virtq *q = &d->vq[NET_TXQ];
 	unsigned int nout;
 	uint16_t head;
 	int n, i;
 
 	while ((n = vq_pop(q, iov, &nout, &head)) > 0) {
-		struct vmpktdesc pkt;
-		struct iovec out;
 		size_t len = 0, skip = NET_HDR_LEN;
-		int count = 1;
 
 		for (i = 0; i < (int)nout; i++) {
 			const uint8_t *p = iov[i].iov_base;
@@ -974,15 +986,8 @@ net_tx(struct virtio_dev *d)
 			memcpy(frame + len, p, l);
 			len += l;
 		}
-		if (len > 0 && len <= d->max_packet && d->iface != NULL) {
-			out.iov_base = frame;
-			out.iov_len = len;
-			memset(&pkt, 0, sizeof(pkt));
-			pkt.vm_pkt_size = len;
-			pkt.vm_pkt_iov = &out;
-			pkt.vm_pkt_iovcnt = 1;
-			(void)vmnet_write(d->iface, &pkt, &count);
-		}
+		if (len > 0 && len <= d->max_packet && net_be.send != NULL)
+			net_be.send(frame, len);
 		vq_push(d, q, head, 0);
 	}
 }
@@ -992,45 +997,32 @@ static void
 net_rx(struct virtio_dev *d)
 {
 	static struct iovec iov[VQ_IOV_MAX];
-	static uint8_t frame[65536];
+	static uint8_t frame[NET_HDR_LEN + NET_FRAME_MAX];
 	struct virtq *q = &d->vq[NET_RXQ];
 
-	if (!q->ready)
+	if (!q->ready || net_be.recv == NULL)
 		return;
 	net_rx_ready = false;
 
 	for (;;) {
-		struct vmpktdesc pkt;
-		struct iovec in;
 		unsigned int nout;
 		uint16_t head, last = q->last_avail;
 		size_t len, done = 0;
-		int count = 1, n, i;
+		int n, i;
 
-		/* Only read a frame once there is somewhere to put it. */
+		/* Only take a frame once there is somewhere to put it. */
 		n = vq_pop(q, iov, &nout, &head);
 		if (n <= 0)
 			return;
-
-		if (d->iface == NULL) {
-			q->last_avail = last;
-			return;
-		}
-		in.iov_base = frame + NET_HDR_LEN;
-		in.iov_len = d->max_packet;
-		memset(&pkt, 0, sizeof(pkt));
-		pkt.vm_pkt_size = d->max_packet;
-		pkt.vm_pkt_iov = &in;
-		pkt.vm_pkt_iovcnt = 1;
-		if (vmnet_read(d->iface, &pkt, &count) != VMNET_SUCCESS ||
-		    count < 1) {
+		len = net_be.recv(frame + NET_HDR_LEN, d->max_packet);
+		if (len == 0) {
 			q->last_avail = last;	/* nothing: put it back */
 			return;
 		}
 
 		memset(frame, 0, NET_HDR_LEN);
 		frame[10] = 1;			/* num_buffers = 1 */
-		len = NET_HDR_LEN + pkt.vm_pkt_size;
+		len += NET_HDR_LEN;
 		for (i = (int)nout; i < n && done < len; i++) {
 			size_t l = iov[i].iov_len;
 
@@ -1070,20 +1062,219 @@ net_finish(struct virtio_dev *d, const uint8_t *mac, char *cmdline,
 	nvdevs++;
 }
 
-/* A card with the cable unplugged: for testing the device without root. */
+/* A new frame is waiting: get the vCPU thread to come and fetch it. */
+static void
+net_wake(void)
+{
+	net_rx_ready = true;
+	pthread_kill(vcpu_thread, SIGUSR1);
+}
+
+/* -- backend: nothing. A card with the cable unplugged, for testing. -- */
+
+static const uint8_t net_local_mac[6] = { 0x5A, 0x94, 0xEF, 0xE4, 0x0C, 0xEE };
+
 static void
 net_add_unplugged(char *cmdline, size_t cmdlen)
 {
-	static const uint8_t mac[6] = { 0x02, 0x4E, 0x56, 0x4D, 0x4D, 0x01 };
 	struct virtio_dev *d = &vdevs[nvdevs];
 
-	d->iface = NULL;
 	d->max_packet = 1514;
-	net_finish(d, mac, cmdline, cmdlen);
+	net_finish(d, net_local_mac, cmdline, cmdlen);
+}
+
+/*
+ * -- backend: a stream socket --
+ *
+ * Each frame is preceded by its length as a 32-bit big-endian number, the
+ * framing QEMU's socket network devices use, so this talks to anything
+ * written for those: gvproxy (-listen-qemu), for one, which gives the guest
+ * DHCP, DNS and a route out with no privileges on the host.
+ *
+ * A thread reads frames into a ring; the vCPU thread empties it.
+ */
+
+#define SOCK_RING	256
+#define SOCK_FRAME	2048
+
+static int sock_fd = -1;
+static pthread_mutex_t sock_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint16_t len; uint8_t data[SOCK_FRAME]; } sock_ring[SOCK_RING];
+static unsigned int sock_head, sock_tail;
+
+static bool
+sock_read_all(void *buf, size_t len)
+{
+	size_t done = 0;
+	ssize_t r;
+
+	while (done < len) {
+		r = read(sock_fd, (char *)buf + done, len - done);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			return false;
+		done += (size_t)r;
+	}
+	return true;
+}
+
+static void *
+sock_reader(void *arg)
+{
+	static uint8_t discard[NET_FRAME_MAX];
+	uint8_t hdr[4];
+	uint32_t len;
+
+	(void)arg;
+	for (;;) {
+		if (!sock_read_all(hdr, 4))
+			break;
+		len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+		    ((uint32_t)hdr[2] << 8) | hdr[3];
+		if (len > sizeof(discard))
+			break;				/* out of step */
+
+		pthread_mutex_lock(&sock_lock);
+		if (len <= SOCK_FRAME && sock_head - sock_tail < SOCK_RING) {
+			const unsigned int slot = sock_head % SOCK_RING;
+
+			pthread_mutex_unlock(&sock_lock);
+			/* Only this thread advances the head. */
+			if (!sock_read_all(sock_ring[slot].data, len))
+				break;
+			sock_ring[slot].len = (uint16_t)len;
+			pthread_mutex_lock(&sock_lock);
+			sock_head++;
+			pthread_mutex_unlock(&sock_lock);
+			net_wake();
+		} else {
+			pthread_mutex_unlock(&sock_lock);
+			if (!sock_read_all(discard, len))	/* full: drop */
+				break;
+		}
+	}
+	fprintf(stderr, "\r\nnvmm-run: the network helper went away\r\n");
+	return NULL;
+}
+
+static size_t
+sock_recv(uint8_t *buf, size_t max)
+{
+	size_t len = 0;
+
+	pthread_mutex_lock(&sock_lock);
+	if (sock_head != sock_tail) {
+		const unsigned int slot = sock_tail % SOCK_RING;
+
+		len = sock_ring[slot].len;
+		if (len > max)
+			len = 0;			/* cannot be: drop it */
+		else
+			memcpy(buf, sock_ring[slot].data, len);
+		sock_tail++;
+	}
+	pthread_mutex_unlock(&sock_lock);
+	return len;
 }
 
 static void
-net_add(char *cmdline, size_t cmdlen)
+sock_send(const uint8_t *buf, size_t len)
+{
+	const uint8_t hdr[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16),
+	    (uint8_t)(len >> 8), (uint8_t)len };
+	struct iovec iov[2] = {
+		{ .iov_base = (void *)(uintptr_t)hdr, .iov_len = 4 },
+		{ .iov_base = (void *)(uintptr_t)buf, .iov_len = len },
+	};
+	size_t done = 0, total = 4 + len;
+	ssize_t r;
+
+	/* A frame must go out whole, or the stream loses its framing. */
+	while (done < total) {
+		r = writev(sock_fd, iov, 2);
+		if (r < 0 && (errno == EINTR || errno == EAGAIN))
+			continue;
+		if (r <= 0)
+			return;
+		done += (size_t)r;
+		if (done >= total)
+			break;
+		if ((size_t)r >= iov[0].iov_len) {
+			r -= (ssize_t)iov[0].iov_len;
+			iov[0].iov_len = 0;
+			iov[1].iov_base = (char *)iov[1].iov_base + r;
+			iov[1].iov_len -= (size_t)r;
+		} else {
+			iov[0].iov_base = (char *)iov[0].iov_base + r;
+			iov[0].iov_len -= (size_t)r;
+		}
+	}
+}
+
+static void
+net_add_socket(const char *path, char *cmdline, size_t cmdlen)
+{
+	struct virtio_dev *d = &vdevs[nvdevs];
+	struct sockaddr_un sun;
+	pthread_t t;
+
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	if (strlen(path) >= sizeof(sun.sun_path))
+		die("socket path too long");
+	strcpy(sun.sun_path, path);
+	sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock_fd == -1 ||
+	    connect(sock_fd, (struct sockaddr *)&sun, sizeof(sun)) == -1)
+		die("cannot connect to the network helper at %s: %s", path,
+		    strerror(errno));
+	if (pthread_create(&t, NULL, sock_reader, NULL) != 0)
+		die("cannot start the network thread");
+
+	net_be.send = sock_send;
+	net_be.recv = sock_recv;
+	d->max_packet = 1514;
+	net_finish(d, net_local_mac, cmdline, cmdlen);
+}
+
+/* -- backend: macOS vmnet. Needs root. -- */
+
+static interface_ref vmnet_if;
+static size_t vmnet_max;
+
+static void
+vmnet_send(const uint8_t *buf, size_t len)
+{
+	struct iovec out = { .iov_base = (void *)(uintptr_t)buf, .iov_len = len };
+	struct vmpktdesc pkt;
+	int count = 1;
+
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.vm_pkt_size = len;
+	pkt.vm_pkt_iov = &out;
+	pkt.vm_pkt_iovcnt = 1;
+	(void)vmnet_write(vmnet_if, &pkt, &count);
+}
+
+static size_t
+vmnet_recv(uint8_t *buf, size_t max)
+{
+	struct iovec in = { .iov_base = buf, .iov_len = max };
+	struct vmpktdesc pkt;
+	int count = 1;
+
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.vm_pkt_size = max;
+	pkt.vm_pkt_iov = &in;
+	pkt.vm_pkt_iovcnt = 1;
+	if (vmnet_read(vmnet_if, &pkt, &count) != VMNET_SUCCESS || count < 1)
+		return 0;
+	return pkt.vm_pkt_size;
+}
+
+static void
+net_add_vmnet(char *cmdline, size_t cmdlen)
 {
 	struct virtio_dev *d = &vdevs[nvdevs];
 	dispatch_queue_t q = dispatch_queue_create("nvmm-run.net", NULL);
@@ -1095,7 +1286,7 @@ net_add(char *cmdline, size_t cmdlen)
 
 	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key,
 	    VMNET_SHARED_MODE);
-	d->iface = vmnet_start_interface(desc, q,
+	vmnet_if = vmnet_start_interface(desc, q,
 	    ^(vmnet_return_t st, xpc_object_t params) {
 		status = st;
 		if (st == VMNET_SUCCESS && params != NULL) {
@@ -1113,25 +1304,28 @@ net_add(char *cmdline, size_t cmdlen)
 		}
 		dispatch_semaphore_signal(sem);
 	});
-	if (d->iface != NULL && dispatch_semaphore_wait(sem,
+	if (vmnet_if != NULL && dispatch_semaphore_wait(sem,
 	    dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0)
-		die("vmnet did not answer within 20 seconds");
-	if (d->iface == NULL || status != VMNET_SUCCESS)
-		die("cannot start a vmnet interface (status %d); the network "
+		die("vmnet did not answer within 20 seconds (vmm/vmnet-probe.c "
+		    "tests it on its own)");
+	if (vmnet_if == NULL || status != VMNET_SUCCESS)
+		die("cannot start a vmnet interface (status %d); vmnet "
 		    "needs root", (int)status);
 
 	/* Frames arrive on vmnet's own thread; the vCPU thread moves them. */
-	vmnet_interface_set_event_callback(d->iface,
+	vmnet_interface_set_event_callback(vmnet_if,
 	    VMNET_INTERFACE_PACKETS_AVAILABLE, q,
 	    ^(interface_event_t ev, xpc_object_t params) {
 		(void)ev;
 		(void)params;
-		net_rx_ready = true;
-		pthread_kill(vcpu_thread, SIGUSR1);
+		net_wake();
 	});
 
-	d->max_packet = (maxpkt != 0 && maxpkt <= 65536 - NET_HDR_LEN) ?
+	vmnet_max = (maxpkt != 0 && maxpkt <= NET_FRAME_MAX) ?
 	    (size_t)maxpkt : 1514;
+	net_be.send = vmnet_send;
+	net_be.recv = vmnet_recv;
+	d->max_packet = vmnet_max;
 	fprintf(stderr, "nvmm-run: network up, MAC "
 	    "%02x:%02x:%02x:%02x:%02x:%02x, largest frame %zu\n", mac[0],
 	    mac[1], mac[2], mac[3], mac[4], mac[5], d->max_packet);
@@ -1589,7 +1783,8 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: nvmm-run -k vmlinuz [-i initramfs] "
-	    "[-d disk.img] [-n] [-m megabytes] [-a \"extra cmdline\"] [-v]\n");
+	    "[-d disk.img] [-n vmnet|socket] [-m megabytes]\n"
+	    "                [-a \"extra cmdline\"] [-v]\n");
 	exit(2);
 }
 
@@ -1597,6 +1792,7 @@ int
 main(int argc, char **argv)
 {
 	const char *kpath = NULL, *ipath = NULL, *dpath = NULL, *extra = "";
+	const char *net = NULL;
 	struct nvmm_assist_callbacks cbs = { io_callback, mem_callback };
 	struct nvmm_vcpu_conf_cpuid cpuid;
 	struct sigaction sa;
@@ -1605,16 +1801,14 @@ main(int argc, char **argv)
 	size_t len = sizeof(tsc_hz);
 	pthread_t kick;
 	long mb = 512;
-	bool want_net = false, unplugged = false;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:d:nNm:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:n:m:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
 		case 'd': dpath = optarg; break;
-		case 'n': want_net = true; break;
-		case 'N': want_net = unplugged = true; break;
+		case 'n': net = optarg; break;
 		case 'm': mb = atol(optarg); break;
 		case 'a': extra = optarg; break;
 		case 'v': verbose = true; break;
@@ -1679,10 +1873,12 @@ main(int argc, char **argv)
 
 	if (dpath != NULL)
 		blk_add(dpath, cmdline, sizeof(cmdline));
-	if (want_net && unplugged)
+	if (net != NULL && strcmp(net, "vmnet") == 0)
+		net_add_vmnet(cmdline, sizeof(cmdline));
+	else if (net != NULL && strcmp(net, "unplugged") == 0)
 		net_add_unplugged(cmdline, sizeof(cmdline));
-	else if (want_net)
-		net_add(cmdline, sizeof(cmdline));
+	else if (net != NULL)
+		net_add_socket(net, cmdline, sizeof(cmdline));
 	snprintf(cmdline + strlen(cmdline), sizeof(cmdline) - strlen(cmdline),
 	    " %s", extra);
 
