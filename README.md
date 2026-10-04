@@ -132,9 +132,18 @@ and debug-register parking, mappings into a process (anywhere and at a fixed
 address), cleanup after a process that exits without unmapping, and that the
 device node survives being looked up hundreds of times.
 
-On a MacBookPro11,1 running macOS 15.7.9 it passes 47 in-kernel checks and
+On a MacBookPro11,1 running macOS 15.7.9 it passes 68 in-kernel checks and
 all process-side checks, repeatedly, with no growth in IOKit object counts,
-and again after a real sleep and wake (both notifications are delivered).
+and (in an earlier version) again after a real sleep and wake.
+`test/darwin/final-check.sh` runs all of it, the libnvmm test and QEMU in
+one go, then unloads and reloads the kext.
+
+The 2M memory path on that machine, two minutes after boot with 8 GB of RAM:
+buffers up to 16 MiB got every 2M run they asked for, in 1 to 60 ms. A 1 GiB
+buffer got 11 of 512 in 0.4 s before the system ran out of contiguous memory,
+and the rest fell back to ordinary pages as designed. So small guests get 2M
+pages; whether a large one does depends on how fragmented memory is, and has
+not been measured on a machine with more RAM.
 
 Running it on a real machine found two bugs that emulation could not:
 
