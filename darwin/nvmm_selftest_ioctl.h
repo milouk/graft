@@ -32,6 +32,10 @@ struct nvmm_selftest_map {
 	uint64_t addr;		/* in: wanted address if fixed; out: actual */
 	uint32_t fixed;
 	uint32_t seed;
+	uint32_t large;		/* out: 2M runs the buffer was built from */
+	uint32_t large_wanted;	/* out: how many would have fitted */
+	uint32_t large_usec;	/* out: time spent finding them */
+	uint32_t pad;
 };
 
 /* Ask the kernel whether it sees the pattern the caller wrote back. */

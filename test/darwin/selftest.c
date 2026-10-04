@@ -91,9 +91,13 @@ map_roundtrip(int fd, uint64_t size, int fixed, uint32_t seed, int unmap)
 	CHECK(ioctl(fd, NVMM_SELFTEST_IOC_VERIFY, &ver) == 0);
 	CHECK(ver.ok == 1);
 
-	printf("  map %s %llu KiB at %p: %s\n", fixed ? "fixed   " : "anywhere",
+	printf("  map %s %llu KiB at %p: %s", fixed ? "fixed   " : "anywhere",
 	    (unsigned long long)(size >> 10), (void *)p,
 	    (bad == 0 && ver.ok == 1) ? "ok" : "MISMATCH");
+	if (map.large_wanted != 0)
+		printf(" (%u of %u 2M runs, %u us)", map.large, map.large_wanted,
+		    map.large_usec);
+	printf("\n");
 
 	if (unmap) {
 		CHECK(ioctl(fd, NVMM_SELFTEST_IOC_UNMAP) == 0);
@@ -183,7 +187,14 @@ main(int argc, char **argv)
 		map_roundtrip(fd, 1ULL << 20, 0, 0x20 + (uint32_t)round, 1);
 		map_roundtrip(fd, 4096, 1, 0x30 + (uint32_t)round, 1);
 		map_roundtrip(fd, 16ULL << 20, 1, 0x40 + (uint32_t)round, 1);
+		/* Not a multiple of 2M: runs, then an ordinary tail. */
+		map_roundtrip(fd, (9ULL << 20) + 4096, 0,
+		    0x60 + (uint32_t)round, 1);
+		map_roundtrip(fd, (5ULL << 20) + 8192, 1,
+		    0x70 + (uint32_t)round, 1);
 	}
+	/* The size a small Docker VM would have. */
+	map_roundtrip(fd, 1ULL << 30, 1, 0x7F, 1);
 
 	/* Two opens are independent: each has its own mapping. */
 	fd2 = open("/dev/nvmm-selftest", O_RDWR);

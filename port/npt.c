@@ -341,7 +341,7 @@ bool
 npt_lookup(const struct npt *npt, uint64_t gpa, uint64_t *hpa, int *prot)
 {
 	const struct npt_table *t = npt->root;
-	unsigned int idx;
+	unsigned int idx = 0;
 	uint64_t pte;
 	int level;
 

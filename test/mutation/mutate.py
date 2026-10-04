@@ -115,7 +115,9 @@ def main():
         sys.exit("refusing to run: src/ or port/ has uncommitted changes:\n" + dirty)
 
     undetected = invalid = 0
-    for name, path, old, new in [m for m in MUTATIONS + KNOWN_BLIND if not ONLY or ONLY in m[0]]:
+    chosen = [m for m in MUTATIONS + KNOWN_BLIND if ONLY in m[0]]
+    ran = len([m for m in chosen if m not in KNOWN_BLIND])
+    for name, path, old, new in chosen:
         blind = (name, path, old, new) in KNOWN_BLIND
         src = open(path).read()
         if src.count(old) != 1:
@@ -142,9 +144,9 @@ def main():
 
     passed, detail = run_tests()
     print("unmutated tree:", "PASS" if passed else f"FAIL ({detail})")
-    print(f"{len(MUTATIONS) - undetected - invalid} of {len(MUTATIONS)} detected, "
+    print(f"{ran - undetected - invalid} of {ran} detected, "
           f"{undetected} not detected, {invalid} invalid, "
-          f"{len(KNOWN_BLIND)} known blind spot(s)")
+          f"{len(chosen) - ran} known blind spot(s)")
     sys.exit(0 if passed and undetected == 0 and invalid == 0 else 1)
 
 

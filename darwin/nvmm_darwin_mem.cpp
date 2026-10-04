@@ -6,12 +6,13 @@
  * into a process. Nothing here depends on the layout of a private kernel
  * structure, which is what broke earlier hypervisor ports to macOS.
  *
- * STATUS: compiles and links. Never loaded.
+ * STATUS: runs on real hardware (macOS 15, Intel) under the self-test.
  */
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOMultiMemoryDescriptor.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/locks.h>
@@ -24,6 +25,17 @@
 extern "C" {
 
 #define NVMM_PAGE	4096ULL
+#define NVMM_LARGE	(2ULL << 20)
+
+/*
+ * Stop asking for 2M runs for one buffer once this much time has gone into
+ * them. Finding contiguous memory on a machine that has been up for a while
+ * can be slow, and a guest that starts with 4K pages beats one that starts
+ * late.
+ */
+#define NVMM_LARGE_BUDGET_NS	(2000ULL * 1000 * 1000)
+
+struct nvmm_darwin_mem_stats nvmm_darwin_mem_stats;
 
 /* Mirrors port/nvmm_port.h; that header is C and drags in the whole engine. */
 #define PORT_SPACE_KERNEL	0
@@ -167,43 +179,190 @@ port_pages_free(void *va, uint64_t pa __unused, size_t npages __unused)
 /* -------------------------------------------------------------------------- */
 /* Memory buffers: guest RAM and the shared communication pages. */
 
+/*
+ * A small buffer is one IOBufferMemoryDescriptor, and 'kva' is its address.
+ *
+ * A buffer of 2M or more is built from parts: as many 2M runs of host-
+ * contiguous, 2M-aligned memory as the system will give, so that the guest
+ * can be mapped with 2M pages, and one ordinary buffer for whatever is left.
+ * An IOMultiMemoryDescriptor strings the parts together so that the whole
+ * can still be mapped into a process, or into the kernel, in one piece.
+ */
 struct port_membuf {
-	IOBufferMemoryDescriptor *desc;
+	IOMemoryDescriptor *desc;	/* what gets mapped and looked up */
+	void *kva;			/* NULL if built from parts */
+	IOMemoryDescriptor **parts;
+	unsigned int nparts;
 	size_t size;
 };
+
+static uint64_t
+mem_now_ns(void)
+{
+	uint64_t abs, ns;
+
+	clock_get_uptime(&abs);
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns;
+}
+
+/*
+ * Kernel-allocated and not pageable, so the pages stay put for as long as
+ * the descriptor exists. kIOMemoryKernelUserShared is what allows it to be
+ * mapped into the emulator as well. No device ever does DMA to guest RAM
+ * through this descriptor, so skip the I/O mapper rather than have it build
+ * mappings for gigabytes of memory.
+ */
+static IOBufferMemoryDescriptor *
+mem_plain(size_t size)
+{
+	IOBufferMemoryDescriptor *d;
+
+	d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryMapperNone,
+	    size, NVMM_PAGE);
+	if (d != NULL)
+		bzero(d->getBytesNoCopy(), size);
+	return d;
+}
+
+/* One 2M run: contiguous for the CPU and aligned to 2M, or nothing. */
+static IOBufferMemoryDescriptor *
+mem_large(void)
+{
+	IOBufferMemoryDescriptor *d;
+	IOByteCount seglen = 0;
+	addr64_t phys;
+
+	d = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+	    kIODirectionInOut | kIOMemoryHostPhysicallyContiguous |
+	    kIOMemoryKernelUserShared | kIOMemoryMapperNone, NVMM_LARGE,
+	    ~(NVMM_LARGE - 1));
+	if (d == NULL)
+		return NULL;
+
+	/* Trust nothing: a run that is not what was asked for is no use. */
+	if (d->prepare() != kIOReturnSuccess) {
+		d->release();
+		return NULL;
+	}
+	phys = d->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
+	d->complete();
+	if (phys == 0 || (phys & (NVMM_LARGE - 1)) != 0 || seglen < NVMM_LARGE) {
+		d->release();
+		return NULL;
+	}
+
+	bzero(d->getBytesNoCopy(), NVMM_LARGE);
+	return d;
+}
+
+static void
+mem_parts_free(IOMemoryDescriptor **parts, unsigned int n, unsigned int cap)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		parts[i]->release();
+	IOFree(parts, cap * sizeof(*parts));
+}
+
+/* Returns false if the buffer should be built the plain way instead. */
+static bool
+mem_build_parts(struct port_membuf *buf, size_t size)
+{
+	const unsigned int cap = (unsigned int)(size / NVMM_LARGE) + 1;
+	const uint64_t t0 = mem_now_ns();
+	IOMemoryDescriptor **parts;
+	IOMultiMemoryDescriptor *multi;
+	unsigned int n = 0, nlarge = 0;
+	size_t done = 0;
+
+	parts = (IOMemoryDescriptor **)IOMalloc(cap * sizeof(*parts));
+	if (parts == NULL)
+		return false;
+
+	while (size - done >= NVMM_LARGE) {
+		IOBufferMemoryDescriptor *d;
+
+		if (mem_now_ns() - t0 > NVMM_LARGE_BUDGET_NS)
+			break;
+		d = mem_large();
+		if (d == NULL)
+			break;
+		parts[n++] = d;
+		nlarge++;
+		done += NVMM_LARGE;
+	}
+
+	nvmm_darwin_mem_stats.last_large = nlarge;
+	nvmm_darwin_mem_stats.last_wanted = (unsigned int)(size / NVMM_LARGE);
+	nvmm_darwin_mem_stats.last_usec =
+	    (unsigned int)((mem_now_ns() - t0) / 1000);
+
+	if (nlarge == 0) {
+		IOFree(parts, cap * sizeof(*parts));
+		return false;
+	}
+
+	if (done < size) {
+		IOBufferMemoryDescriptor *rest = mem_plain(size - done);
+
+		if (rest == NULL) {
+			mem_parts_free(parts, n, cap);
+			return false;
+		}
+		parts[n++] = rest;
+	}
+
+	multi = IOMultiMemoryDescriptor::withDescriptors(parts, n,
+	    kIODirectionInOut, false);
+	if (multi == NULL) {
+		mem_parts_free(parts, n, cap);
+		return false;
+	}
+	/* Wires every part. */
+	if (multi->prepare() != kIOReturnSuccess) {
+		multi->release();
+		mem_parts_free(parts, n, cap);
+		return false;
+	}
+
+	buf->desc = multi;
+	buf->kva = NULL;
+	buf->parts = parts;
+	buf->nparts = n;
+	return true;
+}
 
 struct port_membuf *
 port_membuf_create(size_t size)
 {
 	const size_t rounded = (size + NVMM_PAGE - 1) & ~(NVMM_PAGE - 1);
+	IOBufferMemoryDescriptor *plain;
 	struct port_membuf *buf;
 
 	buf = (struct port_membuf *)IOMalloc(sizeof(*buf));
 	if (buf == NULL)
 		return NULL;
-
-	/*
-	 * Kernel-allocated and not pageable, so the pages stay put for as long
-	 * as the descriptor exists. kIOMemoryKernelUserShared is what allows
-	 * it to be mapped into the emulator as well. No device ever does DMA
-	 * to guest RAM through this descriptor, so skip the I/O mapper rather
-	 * than have it build mappings for gigabytes of memory.
-	 */
-	buf->desc = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryMapperNone,
-	    rounded, NVMM_PAGE);
-	if (buf->desc == NULL) {
-		IOFree(buf, sizeof(*buf));
-		return NULL;
-	}
-	if (buf->desc->prepare() != kIOReturnSuccess) {
-		buf->desc->release();
-		IOFree(buf, sizeof(*buf));
-		return NULL;
-	}
-
-	bzero(buf->desc->getBytesNoCopy(), rounded);
+	bzero(buf, sizeof(*buf));
 	buf->size = rounded;
+
+	if (rounded >= NVMM_LARGE && mem_build_parts(buf, rounded))
+		return buf;
+
+	plain = mem_plain(rounded);
+	if (plain == NULL) {
+		IOFree(buf, sizeof(*buf));
+		return NULL;
+	}
+	if (plain->prepare() != kIOReturnSuccess) {
+		plain->release();
+		IOFree(buf, sizeof(*buf));
+		return NULL;
+	}
+	buf->desc = plain;
+	buf->kva = plain->getBytesNoCopy();
 	return buf;
 }
 
@@ -212,6 +371,10 @@ port_membuf_destroy(struct port_membuf *buf)
 {
 	buf->desc->complete();
 	buf->desc->release();
+	if (buf->parts != NULL) {
+		mem_parts_free(buf->parts, buf->nparts,
+		    (unsigned int)(buf->size / NVMM_LARGE) + 1);
+	}
 	IOFree(buf, sizeof(*buf));
 }
 
@@ -238,11 +401,21 @@ port_membuf_map(struct port_membuf *buf, int space, size_t off, size_t size,
 		return EINVAL;
 
 	if (space == PORT_SPACE_KERNEL) {
-		/* The buffer already lives in the kernel's address space. */
 		if (fixed)
 			return EINVAL;
-		*addr = (uintptr_t)buf->desc->getBytesNoCopy() + off;
-		*cookie = NULL;
+		if (buf->kva != NULL) {
+			/* Already in the kernel's address space. */
+			*addr = (uintptr_t)buf->kva + off;
+			*cookie = NULL;
+			return 0;
+		}
+		/* The parts are scattered; map them side by side. */
+		map = buf->desc->createMappingInTask(kernel_task, 0,
+		    kIOMapAnywhere, off, size);
+		if (map == NULL)
+			return ENOMEM;
+		*addr = (uintptr_t)map->getAddress();
+		*cookie = map;
 		return 0;
 	}
 

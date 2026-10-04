@@ -9,6 +9,14 @@ extern "C" {
 void	nvmm_darwin_mem_init(void);
 void	nvmm_darwin_mem_fini(void);
 
+/* How the most recent buffer of 2M or more was built. Diagnostic only. */
+struct nvmm_darwin_mem_stats {
+	unsigned int last_large;	/* 2M runs obtained */
+	unsigned int last_wanted;	/* 2M runs that would have fitted */
+	unsigned int last_usec;		/* time spent asking for them */
+};
+extern struct nvmm_darwin_mem_stats nvmm_darwin_mem_stats;
+
 void	nvmm_darwin_power_register(void);
 void	nvmm_darwin_power_unregister(void);
 

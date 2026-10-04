@@ -24,6 +24,7 @@
 
 #include "nvmm_selftest_ioctl.h"
 #include "nvmm_darwin_selftest.h"
+#include "nvmm_darwin_mem.h"
 
 extern int cpu_number(void);
 extern unsigned int real_ncpus;
@@ -348,6 +349,116 @@ out:
 	    (unsigned long long)root);
 }
 
+/*
+ * A buffer big enough to be built from 2M runs. However many runs the system
+ * gave, each must have gone into the guest's tables as one 2M page, the whole
+ * buffer must translate, and taking a 4K page out must leave its neighbours
+ * pointing where they did.
+ */
+static void
+st_guest_large(struct st *st)
+{
+	const vsize_t large = 2ULL << 20;
+	const vsize_t size = 4 * large + 16 * 4096;
+	const vaddr_t gpa = 2 * large;
+	const unsigned long nlarge0 = port_vm_nlarge;
+	os_vmspace_t *vs;
+	os_vmmap_t *gmap;
+	os_vmobj_t *obj;
+	vaddr_t kva = 0, g;
+	paddr_t hpa, base, before;
+	unsigned int got, i, ok, run;
+	uint8_t *k;
+	int error;
+
+	vs = os_vmspace_create(0, 1ULL << 40);
+	ST_CHECK(st, vs != NULL);
+	if (vs == NULL)
+		return;
+	gmap = os_vmspace_get_vmmap(vs);
+
+	memset(&nvmm_darwin_mem_stats, 0, sizeof(nvmm_darwin_mem_stats));
+	obj = os_vmobj_create(size);
+	ST_CHECK(st, obj != NULL);
+	if (obj == NULL)
+		goto out;
+	got = nvmm_darwin_mem_stats.last_large;
+	st_log(st, "guest memory: %u of %u 2M runs, found in %u us\n", got,
+	    nvmm_darwin_mem_stats.last_wanted,
+	    nvmm_darwin_mem_stats.last_usec);
+	ST_CHECK(st, got <= 4);
+
+	/* The kernel's view of a buffer made of parts is one piece. */
+	error = os_vmobj_map_kern(os_kernel_map, &kva, size, obj, 0, true,
+	    false, true, PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE);
+	ST_CHECK(st, error == 0 && kva != 0);
+	if (error != 0)
+		goto out_obj;
+	k = (uint8_t *)(uintptr_t)kva;
+	ok = 1;
+	for (i = 0; i < size; i += 4096)
+		ok = ok && (k[i] == 0);
+	ST_CHECK(st, ok);
+	for (i = 0; i < size; i += 4096)
+		k[i] = (uint8_t)(i >> 12) ^ 0x3C;
+	ok = 1;
+	for (i = 0; i < size; i += 4096)
+		ok = ok && (k[i] == (uint8_t)((i >> 12) ^ 0x3C));
+	ST_CHECK(st, ok);
+
+	g = gpa;
+	error = os_vmobj_map_user(gmap, &g, size, obj, 0, false, true, true,
+	    PROT_READ | PROT_WRITE | PROT_EXEC,
+	    PROT_READ | PROT_WRITE | PROT_EXEC);
+	ST_CHECK(st, error == 0);
+	if (error != 0)
+		goto out_kern;
+
+	/* The runs come first in the buffer, and each became a 2M page. */
+	ST_CHECK(st, port_vm_nlarge - nlarge0 == got);
+	for (run = 0; run < got; run++) {
+		base = 0;
+		ok = port_vm_guest_lookup(vs, gpa + run * large, &base) &&
+		    base != 0 && (base & (large - 1)) == 0;
+		for (i = 1; ok && i < 512; i++) {
+			ok = port_vm_guest_lookup(vs,
+			    gpa + run * large + i * 4096ULL, &hpa) &&
+			    hpa == base + i * 4096ULL;
+		}
+		ST_CHECK(st, ok);
+	}
+
+	/* Every page translates, 2M or not. */
+	ok = 0;
+	for (i = 0; i < size / 4096; i++) {
+		if (port_vm_guest_lookup(vs, gpa + i * 4096ULL, &hpa) &&
+		    hpa != 0 && (hpa & 4095) == 0)
+			ok++;
+	}
+	ST_CHECK(st, ok == size / 4096);
+	ST_CHECK(st, !port_vm_guest_lookup(vs, gpa - 4096, &hpa));
+	ST_CHECK(st, !port_vm_guest_lookup(vs, gpa + size, &hpa));
+
+	/* One 4K page out of the first 2M: a split, if it was a 2M page. */
+	before = 0;
+	ST_CHECK(st, port_vm_guest_lookup(vs, gpa + 101 * 4096ULL, &before));
+	os_vmobj_unmap(gmap, gpa + 100 * 4096ULL, gpa + 101 * 4096ULL, false);
+	ST_CHECK(st, !port_vm_guest_lookup(vs, gpa + 100 * 4096ULL, &hpa));
+	ST_CHECK(st, port_vm_guest_lookup(vs, gpa + 99 * 4096ULL, &hpa));
+	ST_CHECK(st, port_vm_guest_lookup(vs, gpa + 101 * 4096ULL, &hpa) &&
+	    hpa == before);
+
+	os_vmobj_unmap(gmap, gpa, gpa + size, false);
+	ST_CHECK(st, !port_vm_guest_lookup(vs, gpa, &hpa));
+	ST_CHECK(st, !port_vm_guest_lookup(vs, gpa + size - 4096, &hpa));
+out_kern:
+	os_vmobj_unmap(os_kernel_map, kva, kva + size, true);
+out_obj:
+	os_vmobj_rel(obj);
+out:
+	os_vmspace_destroy(vs);
+}
+
 static void
 st_misc(struct st *st)
 {
@@ -372,6 +483,7 @@ selftest_run(struct nvmm_selftest_run *out)
 	st_ipi(&st);
 	st_fpu(&st);
 	st_guest_memory(&st);
+	st_guest_large(&st);
 
 	out->sleeps = nvmm_selftest_sleeps;
 	out->wakes = nvmm_selftest_wakes;
@@ -490,9 +602,13 @@ st_do_map(struct st_open *o, struct nvmm_selftest_map *args)
 	if (args->fixed && (args->addr & 4095) != 0)
 		return EINVAL;
 
+	memset(&nvmm_darwin_mem_stats, 0, sizeof(nvmm_darwin_mem_stats));
 	o->obj = os_vmobj_create(args->size);
 	if (o->obj == NULL)
 		return ENOMEM;
+	args->large = nvmm_darwin_mem_stats.last_large;
+	args->large_wanted = nvmm_darwin_mem_stats.last_wanted;
+	args->large_usec = nvmm_darwin_mem_stats.last_usec;
 
 	error = os_vmobj_map_kern(os_kernel_map, &kva, args->size, o->obj, 0,
 	    true, false, true, PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE);
