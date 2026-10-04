@@ -1753,6 +1753,10 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 	struct vmcb *vmcb = cpudata->vmcb;
 	uint64_t machgen;
 	void *hgdt;
+#if defined(NVMM_PORT)
+	unsigned int inkernel_exits = 0;
+	bool host_intr = false;
+#endif
 	int hcpu;
 	int error = 0;
 
@@ -1894,6 +1898,9 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		case VMCB_EXITCODE_INTR:
 		case VMCB_EXITCODE_NMI:
 			exit->reason = NVMM_VCPU_EXIT_NONE;
+#if defined(NVMM_PORT)
+			host_intr = true;
+#endif
 			break;
 		case VMCB_EXITCODE_VINTR:
 			svm_event_waitexit_disable(vcpu, false);
@@ -1965,6 +1972,28 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		if (exit->reason != NVMM_VCPU_EXIT_NONE) {
 			break;
 		}
+#if defined(NVMM_PORT)
+		/*
+		 * The exit was handled here and the guest could simply be
+		 * resumed. A BSD kernel asks its scheduler whether anything is
+		 * waiting; the port layer's hosts cannot. Two rules stand in
+		 * for that question.
+		 *
+		 * A host interrupt ended the guest run: go back to userland.
+		 * Whatever wants this thread to stop running the guest (the
+		 * scheduler's timer, a signal posted from another CPU, an IPI)
+		 * arrives as an interrupt on this CPU, and so as this exit.
+		 *
+		 * Otherwise keep going, but not for ever: an interrupt taken
+		 * in the short stretch of host code between two guest entries
+		 * is serviced without causing an exit, so cap the number of
+		 * exits handled back to back. They cost about a microsecond
+		 * each, so the cap bounds the delay it can add.
+		 */
+		if (host_intr || ++inkernel_exits >= NVMM_PORT_EXIT_BUDGET) {
+			break;
+		}
+#endif
 	}
 
 	svm_vcpu_guest_misc_leave(vcpu);

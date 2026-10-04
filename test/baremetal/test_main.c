@@ -453,6 +453,57 @@ test_fpu(void)
 	CHECK(memcmp(comm->state.fpu.fx_xmm[0].xmm_bytes, expect, 4) == 0);
 }
 
+/*
+ * Exits the engine can handle by itself are handled without going back to the
+ * caller, but only so many in a row: a guest must not be able to keep the
+ * host inside the loop for ever.
+ */
+static void
+test_exit_budget(void)
+{
+	static const uint8_t code[] = {
+		0x46,		/* inc  %si                            */
+		0x0F, 0xA2,	/* cpuid: exits, handled in the kernel */
+		0xEB, 0xFB,	/* jmp  back to the inc                */
+	};
+	struct nvmm_vcpu_exit *exit;
+
+	load(0x7000, code, sizeof(code));
+	set_rip(0x7000);
+	get_state(NVMM_X64_STATE_GPRS);
+	comm->state.gprs[NVMM_X64_GPR_RSI] = 0;
+	set_state(NVMM_X64_STATE_GPRS);
+
+	/*
+	 * One call runs exactly a budget's worth of CPUID exits and comes
+	 * back with nothing for the caller to do. Fewer would mean the engine
+	 * is bouncing every exit out; more, or never returning, would mean
+	 * the cap is not applied.
+	 */
+	exit = run_expect(NVMM_VCPU_EXIT_NONE);
+	(void)exit;
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RSI) & 0xFFFF, NVMM_PORT_EXIT_BUDGET);
+
+	(void)run_expect(NVMM_VCPU_EXIT_NONE);
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RSI) & 0xFFFF,
+	    2 * NVMM_PORT_EXIT_BUDGET);
+
+	/* An exit that needs the caller is still delivered at once. */
+	{
+		static const uint8_t io[] = {
+			0x0F, 0xA2,	/* cpuid          */
+			0x0F, 0xA2,	/* cpuid          */
+			0xE6, 0x80,	/* out %al,$0x80  */
+		};
+
+		load(0x7100, io, sizeof(io));
+		set_rip(0x7100);
+		exit = run_expect(NVMM_VCPU_EXIT_IO);
+		CHECK_EQ(exit->u.io.port, 0x80);
+		CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x7104);
+	}
+}
+
 /* The vCPU loop stops when the host says it has something else to do. */
 static void
 test_return_needed(void)
@@ -589,6 +640,7 @@ kmain(void)
 		RUN(test_memory);
 		RUN(test_cpuid);
 		RUN(test_fpu);
+		RUN(test_exit_budget);
 		RUN(test_return_needed);
 		RUN(test_suspend_resume);
 		RUN(test_teardown);

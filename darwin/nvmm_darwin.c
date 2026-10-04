@@ -209,13 +209,13 @@ bool
 port_return_needed(void)
 {
 	/*
-	 * The vCPU loop holds preemption off, and macOS gives an extension no
-	 * way to ask whether the scheduler or a signal is waiting. So go back
-	 * to userland after every exit and let the kernel do its housekeeping
-	 * on the way. It costs a system call per exit that the engine could
-	 * have handled itself; correctness first.
+	 * macOS gives an extension no way to ask whether the scheduler or a
+	 * signal is waiting for this thread. The engine therefore does not
+	 * rely on this: it returns to userland whenever a host interrupt ends
+	 * a guest run, and after a bounded number of exits it handled itself.
+	 * See NVMM_PORT_EXIT_BUDGET.
 	 */
-	return true;
+	return false;
 }
 
 /* -------------------------------------------------------------------------- */

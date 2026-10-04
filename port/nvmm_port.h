@@ -153,7 +153,11 @@ void	port_preempt_enable(void);
 bool	port_preempt_disabled(void);
 /* Run func(arg) on every CPU, including this one, and wait for all of them. */
 void	port_ipi_broadcast(void (*func)(void *), void *arg);
-/* True when the vCPU loop must return to userland (signal, reschedule...). */
+/*
+ * True when the host knows of a reason for the vCPU loop to return to userland
+ * right now. A host that cannot tell returns false; the engine then applies
+ * the rules described at NVMM_PORT_EXIT_BUDGET.
+ */
 bool	port_return_needed(void);
 
 /* Misc. */
@@ -247,6 +251,12 @@ os_return_needed(void)
 {
 	return port_return_needed();
 }
+
+/*
+ * How many guest exits the engine may handle back to back before it returns
+ * to userland regardless. See the end of the vCPU loop in nvmm_x86_svm.c.
+ */
+#define NVMM_PORT_EXIT_BUDGET	32
 
 /* -------------------------------------------------------------------------- */
 /* Guest memory (nvmm_port_vm.c). */
