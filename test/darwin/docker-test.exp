@@ -5,8 +5,9 @@
 #
 #   sudo ./docker-test.exp <qemu-system-x86_64> <alpine-virt.iso> <disk.qcow2>
 #
-# SMP=n in the environment sets the number of virtual CPUs (default 1);
-# QEMU_EXTRA adds QEMU arguments.
+# In the environment: SMP=n sets the number of virtual CPUs (default 1),
+# MEM the guest's memory (default 2G), ACCEL the accelerator (default nvmm;
+# tcg needs no driver and no root, and is slow), QEMU_EXTRA adds arguments.
 # The Alpine release in the repository URLs below must match the ISO.
 
 if {$argc != 3} {
@@ -21,31 +22,44 @@ if {[info exists env(SMP)]} { set smp $env(SMP) }
 # QEMU_EXTRA in the environment adds arguments, for debugging.
 set extra {}
 if {[info exists env(QEMU_EXTRA)]} { set extra [split $env(QEMU_EXTRA)] }
+set accel nvmm
+if {[info exists env(ACCEL)]} { set accel $env(ACCEL) }
+set mem 2G
+if {[info exists env(MEM)]} { set mem $env(MEM) }
 
-set timeout 180
-spawn $qemu -accel nvmm -M q35 -m 4G -smp $smp -nographic \
+# QEMU does not run on a terminal of this script's. It treats a hangup of its
+# terminal as a request to quit, and says so only to that terminal, which
+# makes a dropped terminal look like a guest that powered itself off. The
+# guest's console is a socket instead, and QEMU's messages go to a file.
+set dir [file dirname [file normalize $disk]]
+set sock $dir/serial.sock
+set qerr $dir/qemu.err
+file delete -force $sock
+set qpid [exec $qemu -accel $accel -M q35 -m $mem -smp $smp -display none \
+    -monitor none -serial unix:$sock,server=on,wait=off \
     -cdrom $iso -drive file=$disk,if=virtio \
-    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 {*}$extra
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 {*}$extra \
+    < /dev/null > $qerr 2>@1 &]
+puts "QEMU is pid $qpid; its messages are in $qerr"
 
-# LLDB_OUT=<file> attaches lldb to QEMU, with a breakpoint on exit(), and
-# writes every thread's backtrace there when it is hit.
-if {[info exists env(LLDB_OUT)]} {
-    set qpid [exp_pid]
-    exec sh -c "lldb -p $qpid -b \
-        -o 'process handle SIGUSR1 SIGUSR2 SIGALRM SIGPIPE SIGIO SIGCHLD -n false -p true -s false' \
-        -o 'breakpoint set -n exit' -o 'continue' \
-        -o 'thread backtrace all' -o 'register read' -o 'detach' \
-        > $env(LLDB_OUT) 2>&1" &
-    sleep 3
+for {set i 0} {$i < 50 && ![file exists $sock]} {incr i} { after 100 }
+if {![file exists $sock]} {
+    puts "### QEMU did not start:"
+    catch {puts [exec cat $qerr]}
+    exit 1
 }
 
-# How QEMU ended: its exit code, or the signal that killed it.
+set timeout 180
+spawn nc -U $sock
+
+# What QEMU said, and whether it is still running.
 proc qemu_status {} {
-    set w [wait]
-    if {[llength $w] > 4} {
-        return "killed: [lrange $w 4 end]"
-    }
-    return "exit code [lindex $w 3]"
+    global qpid qerr
+    after 500
+    set alive [expr {![catch {exec kill -0 $qpid}]}]
+    set msg ""
+    catch {set msg [exec grep -v "Unexpected .*MSR" $qerr]}
+    return "[expr {$alive ? "still running" : "gone"}]; messages: $msg"
 }
 
 proc run {cmd {t 180}} {
@@ -53,21 +67,24 @@ proc run {cmd {t 180}} {
     send -- "$cmd\r"
     expect {
         -re {localhost:~# $} {}
-        timeout { puts "\n### TIMEOUT waiting after: $cmd"; exit 1 }
-        eof { puts "\n### QEMU EXITED during: $cmd ([qemu_status])"; exit 1 }
+        timeout { puts "\n### TIMEOUT waiting after: $cmd ([qemu_status])"; exit 1 }
+        eof { puts "\n### CONSOLE CLOSED during: $cmd ([qemu_status])"; exit 1 }
     }
 }
 
 expect {
     "login: " {}
-    timeout { puts "\n### TIMEOUT waiting for the login prompt"; exit 1 }
-    eof { puts "\n### QEMU EXITED before login"; exit 1 }
+    timeout { puts "\n### TIMEOUT waiting for the login prompt ([qemu_status])"; exec kill $qpid; exit 1 }
+    eof { puts "\n### CONSOLE CLOSED before login ([qemu_status])"; exit 1 }
 }
 send "root\r"
 expect -re {localhost:~# $}
 
 run {uname -a; nproc; free -m | head -2; date}
-run {ip link set eth0 up && udhcpc -i eth0 -q -n} 60
+# OpenRC will not start Docker unless its "networking" service is up, and
+# that service wants this file.
+run {printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces}
+run {rc-service networking start; ip -4 addr show eth0 | grep inet} 90
 run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/main > /etc/apk/repositories}
 run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/community >> /etc/apk/repositories}
 run {apk update} 120
@@ -83,4 +100,4 @@ run {echo NVMM-DOCKER-TEST-DONE}
 send "poweroff\r"
 set timeout 90
 expect eof
-puts "\n### QEMU ended after poweroff ([qemu_status])"
+puts "\n### after poweroff: QEMU [qemu_status]"
