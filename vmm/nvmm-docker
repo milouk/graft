@@ -16,6 +16,11 @@
 # The Docker daemon is reached through a socket in that directory, which
 # only its owner can open. gvproxy carries it to the VM over SSH, with the
 # key the image was built with; "nvmm-docker ssh" uses the same way in.
+#
+# Ports that containers publish (docker run -p) appear on this Mac too, on
+# the loopback address; set NVMM_DOCKER_BIND=0.0.0.0 to offer them to the
+# network as well. A watcher asks Docker every two seconds which ports are
+# published and has gvproxy pass them through, TCP only.
 
 set -eu
 
@@ -25,6 +30,9 @@ GVPROXY=${GVPROXY:-gvproxy}
 MEM=${NVMM_DOCKER_MEM:-2048}
 SSH_PORT=${NVMM_DOCKER_SSH_PORT:-2222}
 SOCK="$DIR/docker.sock"
+CTL="$DIR/ctl.sock"
+BIND=${NVMM_DOCKER_BIND:-127.0.0.1}
+GUEST=192.168.127.2		# the address gvproxy gives the VM
 
 vm_pid()  { cat "$DIR/vm.pid" 2>/dev/null || true; }
 net_pid() { cat "$DIR/gvproxy.pid" 2>/dev/null || true; }
@@ -36,6 +44,32 @@ vm_ssh() {
 	ssh -q -i "$DIR/id_nvmm" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
 	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
 	    root@127.0.0.1 "$@"
+}
+
+forwarder() {	# forwarder expose|unexpose <json>
+	curl -s -m 3 --unix-socket "$CTL" -X POST -d "$2" \
+	    "http://gvproxy/services/forwarder/$1" > /dev/null 2>&1 || true
+}
+
+# Keep the Mac's ports in step with what containers publish.
+watch_ports() {
+	have=""
+	while alive "$(vm_pid)"; do
+		want=$(curl -s -m 3 --unix-socket "$SOCK" \
+		    http://docker/containers/json 2>/dev/null |
+		    grep -o '"PublicPort":[0-9]*,"Type":"tcp"' |
+		    grep -o '[0-9][0-9]*' | sort -un | tr '\n' ' ')
+		for p in $want; do
+			case " $have " in *" $p "*) continue ;; esac
+			forwarder expose "{\"local\":\"$BIND:$p\",\"remote\":\"$GUEST:$p\"}"
+		done
+		for p in $have; do
+			case " $want " in *" $p "*) continue ;; esac
+			forwarder unexpose "{\"local\":\"$BIND:$p\"}"
+		done
+		have=$want
+		sleep 2
+	done
 }
 
 start() {
@@ -50,8 +84,9 @@ start() {
 
 	# gvproxy is the VM's network, and it also carries the Docker socket:
 	# it keeps trying the VM's SSH server until that is up.
-	rm -f "$DIR/net.sock" "$DIR/console.in" "$SOCK"
-	"$GVPROXY" -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
+	rm -f "$DIR/net.sock" "$DIR/console.in" "$SOCK" "$CTL"
+	"$GVPROXY" -listen "unix://$CTL" \
+	    -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
 	    -forward-sock "$SOCK" -forward-dest /var/run/docker.sock \
 	    -forward-user root -forward-identity "$DIR/id_nvmm" \
 	    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
@@ -73,6 +108,8 @@ start() {
 	while [ $i -lt 120 ]; do
 		alive "$(vm_pid)" || { echo "the VM stopped; see $DIR/console.log" >&2; exit 1; }
 		if ping_docker; then
+			watch_ports > /dev/null 2>&1 &
+			echo $! > "$DIR/ports.pid"
 			echo "Docker is up. Use it with:"
 			echo "  export DOCKER_HOST=unix://$SOCK"
 			return 0
@@ -100,9 +137,11 @@ stop() {
 			kill "$pid"
 		fi
 	fi
+	wpid=$(cat "$DIR/ports.pid" 2>/dev/null || true)
+	alive "$wpid" && kill "$wpid"
 	alive "$(net_pid)" && kill "$(net_pid)"
-	rm -f "$DIR/vm.pid" "$DIR/gvproxy.pid" "$DIR/net.sock" "$SOCK" \
-	    "$DIR/console.in"
+	rm -f "$DIR/vm.pid" "$DIR/gvproxy.pid" "$DIR/ports.pid" \
+	    "$DIR/net.sock" "$SOCK" "$CTL" "$DIR/console.in"
 	echo "stopped"
 }
 
