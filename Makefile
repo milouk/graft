@@ -20,7 +20,7 @@ COMMON_INC	:= -Iport -Iport/compat -Isrc
 WARN		:= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 		   -Wno-missing-field-initializers
 
-.PHONY: all check unit bare test-bare kext release selftest guest-test libnvmm clean
+.PHONY: all check unit bare test-bare kext release selftest guest-test vmm libnvmm clean
 all: check
 check: unit test-bare kext
 
@@ -192,6 +192,13 @@ $(INC_DIR)/sys/bitops.h: port/compat/sys/bitops.h
 $(LIBNVMM): lib/libnvmm.c lib/libnvmm_x86.c lib/libnvmm_darwin.h $(LIB_HEADERS)
 	$(CC) $(USER_CFLAGS) -Ilib -c lib/libnvmm.c -o $(BUILD)/libnvmm.o
 	rm -f $@ && ar rcs $@ $(BUILD)/libnvmm.o
+
+# A small VMM in place of QEMU: boots a Linux kernel directly.
+VMM_TOOL	:= $(BUILD)/nvmm-run
+vmm: $(VMM_TOOL)
+$(VMM_TOOL): vmm/nvmm-run.c $(LIBNVMM)
+	@mkdir -p $(BUILD)
+	$(CC) $(USER_CFLAGS) -o $@ vmm/nvmm-run.c $(LIBNVMM)
 
 # The first real guests. Needs NVMM.kext loaded on an AMD machine.
 GUEST_TOOL	:= $(BUILD)/nvmm-guest-test
