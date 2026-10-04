@@ -742,6 +742,8 @@ struct virtio_dev {
 	uint8_t config[64];
 	void (*notify)(struct virtio_dev *, unsigned int);
 	int fd;				/* block: the image */
+	pthread_t worker;		/* block: the thread that does the I/O */
+	unsigned long resets;		/* times the guest has reset the device */
 	size_t max_packet;		/* network: largest frame */
 };
 
@@ -832,6 +834,7 @@ static void
 virtio_reset(struct virtio_dev *d)
 {
 	memset(d->vq, 0, sizeof(d->vq));
+	d->resets++;
 	d->status = 0;
 	d->isr = 0;
 	d->driver_features = 0;
@@ -941,39 +944,80 @@ blk_rw(int fd, bool wr, const struct iovec *iov, int n, off_t off)
 	return total;
 }
 
+/*
+ * Requests are served by a thread of the device's own, which lets go of
+ * 'big' while it reads or writes. Done on the CPU's thread with the lock
+ * held, one slow write to the host's disk stops every CPU of the guest for
+ * as long as it takes: seen as a 22-second stall under load.
+ */
+static pthread_cond_t blk_cond = PTHREAD_COND_INITIALIZER;
+
 static void
 blk_notify(struct virtio_dev *d, unsigned int qi)
 {
-	static struct iovec iov[VQ_IOV_MAX];
-	struct virtq *q = &d->vq[qi];
+	(void)d;
+	(void)qi;
+	pthread_cond_broadcast(&blk_cond);
+}
+
+static void *
+blk_worker(void *arg)
+{
+	static struct iovec iov[VIRTIO_MAXDEV][VQ_IOV_MAX];
+	struct virtio_dev *d = arg;
+	struct iovec *v = iov[d - vdevs];
+	struct virtq *q = &d->vq[0];
+	unsigned long resets;
 	unsigned int nout;
 	uint16_t head;
 	int n;
 
-	while ((n = vq_pop(q, iov, &nout, &head)) > 0) {
+	pthread_mutex_lock(&big);
+	while (running) {
 		struct { uint32_t type, rsvd; uint64_t sector; } hdr;
 		uint8_t *status;
 		uint32_t written = 1;
 		ssize_t r = 0;
 
+		n = q->ready ? vq_pop(q, v, &nout, &head) : 0;
+		if (n < 0) {
+			fprintf(stderr,
+			    "[virtio-blk: bad request from the guest]\r\n");
+			n = 0;
+		}
+		if (n == 0) {
+			struct timespec ts;
+			struct timeval tv;
+
+			/* Woken by a notify; the timeout is for shutdown. */
+			gettimeofday(&tv, NULL);
+			ts.tv_sec = tv.tv_sec + 1;
+			ts.tv_nsec = tv.tv_usec * 1000;
+			(void)pthread_cond_timedwait(&blk_cond, &big, &ts);
+			continue;
+		}
+
 		/* A header to read, a status byte to write, data between. */
-		if (nout < 1 || iov[0].iov_len != sizeof(hdr) ||
-		    (unsigned int)n == nout || iov[n - 1].iov_len != 1) {
+		if (nout < 1 || v[0].iov_len != sizeof(hdr) ||
+		    (unsigned int)n == nout || v[n - 1].iov_len != 1) {
 			vq_push(d, q, head, 0);
 			continue;
 		}
-		memcpy(&hdr, iov[0].iov_base, sizeof(hdr));
-		status = iov[n - 1].iov_base;
+		memcpy(&hdr, v[0].iov_base, sizeof(hdr));
+		status = v[n - 1].iov_base;
 
+		/* The buffers are the guest's own memory: no lock needed. */
+		resets = d->resets;
+		pthread_mutex_unlock(&big);
 		switch (hdr.type) {
 		case 0:					/* read */
-			r = blk_rw(d->fd, false, iov + nout, n - 1 - (int)nout,
+			r = blk_rw(d->fd, false, v + nout, n - 1 - (int)nout,
 			    (off_t)(hdr.sector * 512));
 			if (r >= 0)
 				written += (uint32_t)r;
 			break;
 		case 1:					/* write */
-			r = blk_rw(d->fd, true, iov + 1, (int)nout - 1,
+			r = blk_rw(d->fd, true, v + 1, (int)nout - 1,
 			    (off_t)(hdr.sector * 512));
 			break;
 		case 4:					/* flush */
@@ -981,9 +1025,9 @@ blk_notify(struct virtio_dev *d, unsigned int qi)
 			break;
 		case 8:					/* identify */
 			if ((unsigned int)n - nout == 2 &&
-			    iov[nout].iov_len >= 20) {
-				memset(iov[nout].iov_base, 0, 20);
-				memcpy(iov[nout].iov_base, "nvmm-run", 8);
+			    v[nout].iov_len >= 20) {
+				memset(v[nout].iov_base, 0, 20);
+				memcpy(v[nout].iov_base, "nvmm-run", 8);
 				written += 20;
 			}
 			break;
@@ -992,10 +1036,14 @@ blk_notify(struct virtio_dev *d, unsigned int qi)
 			break;
 		}
 		*status = (r == -2) ? 2 : (r < 0) ? 1 : 0;
-		vq_push(d, q, head, written);
+		pthread_mutex_lock(&big);
+
+		/* Unless the guest reset the device meanwhile. */
+		if (q->ready && d->resets == resets)
+			vq_push(d, q, head, written);
 	}
-	if (n < 0)
-		fprintf(stderr, "[virtio-blk: bad request from the guest]\r\n");
+	pthread_mutex_unlock(&big);
+	return NULL;
 }
 
 /* Returns the kernel command line fragment that announces the device. */
@@ -1024,6 +1072,9 @@ blk_add(const char *path, char *cmdline, size_t cmdlen)
 	    " virtio_mmio.device=4K@%#llx:%d",
 	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
 	nvdevs++;
+
+	if (pthread_create(&d->worker, NULL, blk_worker, d) != 0)
+		die("cannot start the disk thread");
 }
 
 /* ---- the network card ---- */
