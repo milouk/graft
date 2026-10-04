@@ -1,24 +1,26 @@
 # Graft
 
-**A small, portable virtualization layer.** Hardware virtualization for
-systems whose vendor does not provide it, starting with macOS on AMD
-processors.
+**A hypervisor you bring yourself, for x86 hosts that do not have one.**
 
 Running a virtual machine normally depends on the operating system's vendor:
 the hypervisor is part of their kernel, and if they do not provide one for
-your hardware, nothing you install will change that. Graft is a hypervisor
-you bring yourself. It is [NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/),
-the hypervisor of NetBSD and DragonFly BSD, on a thin layer that asks the
-host for very little: memory it can pin, a way to share a buffer with a
-process, a way to run a function on every CPU, and locks. Port that layer
-and the rest comes with it, including a small machine monitor that boots
-Linux and runs containers.
+your hardware, nothing you install will change that. Graft is
+[NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/), the hypervisor
+of NetBSD and DragonFly BSD, on a thin layer that asks the host for very
+little: memory it can pin, a way to share a buffer with a process, a way to
+run a function on every CPU, and locks. Port that layer and the rest comes
+with it, including a small machine monitor that boots Linux and runs
+containers.
 
 | | Today | Not yet |
 | --- | --- | --- |
-| Processors | AMD (AMD-V) | Intel: NVMM has the engine upstream, and it has not been brought through the layer. Arm: there is no engine |
+| Processors | AMD, with AMD-V and nested paging | Intel: NVMM has the engine, and it has not been brought through the layer |
 | Hosts | macOS, as a kernel extension; and a bare test kernel that is no operating system at all | Any other system |
 | Guests | Linux, booted directly | Anything that needs firmware |
+
+It is x86 only, and meant to stay that way: hardware virtualization is a
+different mechanism on every processor family, and the engines here are
+NVMM's.
 
 The first host is macOS on AMD, because that is a gap with no other fix:
 Apple's Hypervisor framework does not work on AMD CPUs, which on an AMD
