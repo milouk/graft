@@ -121,6 +121,31 @@ st_memory(struct st *st)
 		port_pages_free(va, pa, 4);
 	}
 	st_log(st, "memory: single page pa %#llx\n", (unsigned long long)pa);
+
+	/*
+	 * The sizes the engine asks for per vCPU (VMCB 1, MSR bitmap 2, I/O
+	 * bitmap 3 pages), over and over. Contiguity that only holds while
+	 * memory is fresh after boot is not good enough.
+	 */
+	{
+		unsigned int round, ok = 0, total = 0;
+		size_t n;
+
+		for (round = 0; round < 64; round++) {
+			for (n = 1; n <= 4; n++) {
+				total++;
+				va = NULL;
+				if (port_pages_alloc(n, &va, &pa) == 0) {
+					ok++;
+					memset(va, 0x77, n * 4096);
+					port_pages_free(va, pa, n);
+				}
+			}
+		}
+		ST_CHECK(st, ok == total);
+		st_log(st, "memory: %u of %u contiguous allocations ok\n", ok,
+		    total);
+	}
 }
 
 static void

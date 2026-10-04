@@ -91,10 +91,20 @@ port_pages_alloc(size_t npages, void **va, uint64_t *pa)
 	if (run == NULL)
 		return ENOMEM;
 
-	/* Any physical address, page aligned, one contiguous run. */
+	/*
+	 * Any physical address, page aligned, one contiguous run.
+	 *
+	 * The flag has to be the HOST one. On a machine with an I/O mapper
+	 * (VT-d), kIOMemoryPhysicallyContiguous only promises a run that is
+	 * contiguous as a device sees it through the mapper, and the pages
+	 * behind it can be anywhere. The CPU reads a VMCB and its bitmaps by
+	 * real physical address, so that is the contiguity that matters. A
+	 * 2013 MacBook Pro showed the difference: four "contiguous" pages came
+	 * back as runs of one or two.
+	 */
 	desc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size,
-	    0xFFFFFFFFFFFFF000ULL);
+	    kIODirectionInOut | kIOMemoryHostPhysicallyContiguous |
+	    kIOMemoryMapperNone, size, 0xFFFFFFFFFFFFF000ULL);
 	if (desc == NULL) {
 		printf("nvmm: no %zu contiguous page(s) available\n", npages);
 		IOFree(run, sizeof(*run));
@@ -175,10 +185,13 @@ port_membuf_create(size_t size)
 	/*
 	 * Kernel-allocated and not pageable, so the pages stay put for as long
 	 * as the descriptor exists. kIOMemoryKernelUserShared is what allows
-	 * it to be mapped into the emulator as well.
+	 * it to be mapped into the emulator as well. No device ever does DMA
+	 * to guest RAM through this descriptor, so skip the I/O mapper rather
+	 * than have it build mappings for gigabytes of memory.
 	 */
 	buf->desc = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-	    kIODirectionInOut | kIOMemoryKernelUserShared, rounded, NVMM_PAGE);
+	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryMapperNone,
+	    rounded, NVMM_PAGE);
 	if (buf->desc == NULL) {
 		IOFree(buf, sizeof(*buf));
 		return NULL;
