@@ -35,8 +35,19 @@
 
 #include "nvmm_os.h"
 
+#if defined(NVMM_PORT)
+/*
+ * The machine table is static and every vCPU slot gets a lock at load time,
+ * so these two numbers set the driver's idle footprint. Upstream's 128 x 128
+ * costs over a megabyte and 16,384 locks before anything runs; a desktop host
+ * will not come near either limit.
+ */
+#define NVMM_MAX_MACHINES	16
+#define NVMM_MAX_VCPUS		64
+#else
 #define NVMM_MAX_MACHINES	128
 #define NVMM_MAX_VCPUS		128
+#endif
 #define NVMM_MAX_HMAPPINGS	32
 
 #define NVMM_MAX_RAM		(128ULL * (1 << 30))
