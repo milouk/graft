@@ -13,7 +13,9 @@
 # login and one command.
 #
 # QEMU's software emulation is the default: no driver, no root, a quarter of
-# an hour. ACCEL=nvmm in the environment takes a minute or two. SIZE sets the
+# an hour. ACCEL=nvmm in the environment takes a minute or two. FLAVOR picks
+# what the image runs containers with, "docker" (the default) or
+# "containerd"; guest-build.sh explains the difference. SIZE sets the
 # size of the root filesystem (default 4G). The Alpine release in
 # guest-build.sh must match the ISO, whose kernel modules the image uses;
 # nvmm-run must then boot that same kernel (the ISO's boot/vmlinuz-virt).
@@ -32,6 +34,8 @@ set accel tcg
 if {[info exists env(ACCEL)]} { set accel $env(ACCEL) }
 set size 4G
 if {[info exists env(SIZE)]} { set size $env(SIZE) }
+set flavor docker
+if {[info exists env(FLAVOR)]} { set flavor $env(FLAVOR) }
 
 set outdir [file normalize $outdir]
 set here [file dirname [file normalize [info script]]]
@@ -59,7 +63,7 @@ close $fh
 
 # The script, with the public key in front of it, padded to a whole number
 # of sectors with newlines.
-exec sh -c "printf 'PUBKEY=\"%s\"\n' '$pubkey' > '$script'; \
+exec sh -c "printf 'PUBKEY=\"%s\"\nFLAVOR=%s\n' '$pubkey' '$flavor' > '$script'; \
     cat '$here/guest-build.sh' >> '$script'; \
     n=\$(wc -c < '$script'); pad=\$(( (512 - n % 512) % 512 + 512 )); \
     awk -v n=\$pad 'BEGIN { for (i = 0; i < n; i++) printf \"\\n\" }' >> '$script'"
@@ -115,4 +119,7 @@ for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
 if {$isize <= 0} { puts "### no initramfs size reported"; exit 1 }
 exec head -c $isize $scratch > $initramfs
 file delete -force $script $scratch $sock
-puts "\n### built $rootfs and $initramfs ($isize bytes); key in $key"
+set fh [open $outdir/flavor w]
+puts $fh $flavor
+close $fh
+puts "\n### built $rootfs ($flavor) and $initramfs ($isize bytes); key in $key"

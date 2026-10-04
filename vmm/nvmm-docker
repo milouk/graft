@@ -8,6 +8,7 @@
 #   nvmm-docker status    say whether it is running
 #   nvmm-docker console   show what the VM has printed
 #   nvmm-docker ssh [cmd] a shell, or a command, in the VM
+#   nvmm-docker nerdctl … nerdctl in the VM, for an image built without Docker
 #
 # It needs, in $NVMM_DOCKER_DIR (default ~/.nvmm-docker): vmlinuz-virt,
 # initramfs-nvmm, rootfs.img and id_nvmm, as made by vmm/build-image.exp.
@@ -18,6 +19,10 @@
 # The Docker daemon is reached through a socket in that directory, which
 # only its owner can open. gvproxy carries it to the VM over SSH, with the
 # key the image was built with; "nvmm-docker ssh" uses the same way in.
+#
+# An image built with FLAVOR=containerd has no Docker daemon and so no such
+# socket. Its containers are run with nerdctl, which takes docker's own
+# command line, inside the VM: "nvmm-docker nerdctl run --rm alpine true".
 #
 # Ports that containers publish (docker run -p) appear on this Mac too, on
 # the loopback address; set NVMM_DOCKER_BIND=0.0.0.0 to offer them to the
@@ -36,6 +41,7 @@ SOCK="$DIR/docker.sock"
 CTL="$DIR/ctl.sock"
 BIND=${NVMM_DOCKER_BIND:-127.0.0.1}
 GUEST=192.168.127.2		# the address gvproxy gives the VM
+FLAVOR=$(cat "$DIR/flavor" 2>/dev/null || echo docker)
 
 vm_pid()  { cat "$DIR/vm.pid" 2>/dev/null || true; }
 net_pid() { cat "$DIR/gvproxy.pid" 2>/dev/null || true; }
@@ -48,6 +54,26 @@ vm_ssh() {
 	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
 	    root@127.0.0.1 "$@"
 }
+# Is the container runtime answering? How to ask depends on which it is.
+runtime_up() {
+	if [ "$FLAVOR" = containerd ]; then
+		vm_ssh nerdctl info > /dev/null 2>&1
+	else
+		ping_docker
+	fi
+}
+# The TCP ports containers have published, one per line.
+published_ports() {
+	if [ "$FLAVOR" = containerd ]; then
+		vm_ssh "nerdctl ps --format '{{.Ports}}'" 2>/dev/null |
+		    grep -o ':[0-9]*->[0-9]*/tcp' | grep -o '^:[0-9]*' | tr -d :
+	else
+		curl -s -m 3 --unix-socket "$SOCK" \
+		    http://docker/containers/json 2>/dev/null |
+		    grep -o '"PublicPort":[0-9]*,"Type":"tcp"' |
+		    grep -o '[0-9][0-9]*'
+	fi
+}
 
 forwarder() {	# forwarder expose|unexpose <json>
 	curl -s -m 3 --unix-socket "$CTL" -X POST -d "$2" \
@@ -58,10 +84,7 @@ forwarder() {	# forwarder expose|unexpose <json>
 watch_ports() {
 	have=""
 	while alive "$(vm_pid)"; do
-		want=$(curl -s -m 3 --unix-socket "$SOCK" \
-		    http://docker/containers/json 2>/dev/null |
-		    grep -o '"PublicPort":[0-9]*,"Type":"tcp"' |
-		    grep -o '[0-9][0-9]*' | sort -un | tr '\n' ' ')
+		want=$(published_ports | sort -un | tr '\n' ' ')
 		for p in $want; do
 			case " $have " in *" $p "*) continue ;; esac
 			forwarder expose "{\"local\":\"$BIND:$p\",\"remote\":\"$GUEST:$p\"}"
@@ -71,6 +94,8 @@ watch_ports() {
 			forwarder unexpose "{\"local\":\"$BIND:$p\"}"
 		done
 		have=$want
+		# Asking a VM without Docker means an SSH login each time.
+		[ "$FLAVOR" = containerd ] && sleep 3
 		sleep 2
 	done
 }
@@ -88,12 +113,19 @@ start() {
 	# gvproxy is the VM's network, and it also carries the Docker socket:
 	# it keeps trying the VM's SSH server until that is up.
 	rm -f "$DIR/net.sock" "$DIR/console.in" "$SOCK" "$CTL"
-	"$GVPROXY" -listen "unix://$CTL" \
-	    -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
-	    -forward-sock "$SOCK" -forward-dest /var/run/docker.sock \
-	    -forward-user root -forward-identity "$DIR/id_nvmm" \
-	    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
-	    > /dev/null 2>&1 &
+	if [ "$FLAVOR" = containerd ]; then
+		"$GVPROXY" -listen "unix://$CTL" \
+		    -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
+		    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
+		    > /dev/null 2>&1 &
+	else
+		"$GVPROXY" -listen "unix://$CTL" \
+		    -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
+		    -forward-sock "$SOCK" -forward-dest /var/run/docker.sock \
+		    -forward-user root -forward-identity "$DIR/id_nvmm" \
+		    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
+		    > /dev/null 2>&1 &
+	fi
 	i=0
 	while [ ! -S "$DIR/net.sock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 	[ -S "$DIR/net.sock" ] || { echo "gvproxy did not start; see $DIR/gvproxy.log" >&2; exit 1; }
@@ -110,17 +142,22 @@ start() {
 	i=0
 	while [ $i -lt 120 ]; do
 		alive "$(vm_pid)" || { echo "the VM stopped; see $DIR/console.log" >&2; exit 1; }
-		if ping_docker; then
+		if runtime_up; then
 			watch_ports > /dev/null 2>&1 &
 			echo $! > "$DIR/ports.pid"
-			echo "Docker is up. Use it with:"
-			echo "  export DOCKER_HOST=unix://$SOCK"
+			if [ "$FLAVOR" = containerd ]; then
+				echo "containerd is up. Use it with:"
+				echo "  $0 nerdctl run --rm alpine uname -a"
+			else
+				echo "Docker is up. Use it with:"
+				echo "  export DOCKER_HOST=unix://$SOCK"
+			fi
 			return 0
 		fi
 		sleep 0.5
 		i=$((i + 1))
 	done
-	echo "the VM is running but Docker did not answer; see $DIR/console.log" >&2
+	echo "the VM is running but $FLAVOR did not answer; see $DIR/console.log" >&2
 	exit 1
 }
 
@@ -153,11 +190,20 @@ start)   start ;;
 stop)    stop ;;
 status)
 	if alive "$(vm_pid)"; then
-		echo "running (pid $(vm_pid)); Docker $(ping_docker && echo answers || echo "does not answer") on unix://$SOCK"
+		echo "running (pid $(vm_pid)); $FLAVOR $(runtime_up && echo answers || echo "does not answer")"
 	else
 		echo "not running"
 	fi ;;
 console) cat "$DIR/console.log" ;;
 ssh)	 shift; vm_ssh "$@" ;;
-*)	 echo "usage: nvmm-docker start|stop|status|console|ssh" >&2; exit 2 ;;
+nerdctl)
+	# ssh joins its arguments with spaces and the far shell splits them
+	# again, so each is quoted for that shell first.
+	shift
+	cmd=nerdctl
+	for a in "$@"; do
+		cmd="$cmd '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
+	done
+	if [ -t 0 ]; then vm_ssh -t "$cmd"; else vm_ssh "$cmd"; fi ;;
+*)	 echo "usage: nvmm-docker start|stop|status|console|ssh|nerdctl" >&2; exit 2 ;;
 esac

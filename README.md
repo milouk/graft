@@ -1,19 +1,29 @@
 # Graft
 
-**Hardware virtualization for macOS on AMD processors, and Docker on top of
-it.**
+**A small, portable virtualization layer.** Hardware virtualization for
+systems whose vendor does not provide it, starting with macOS on AMD
+processors.
 
-macOS only offers hardware virtualization through Apple's Hypervisor
-framework, and that framework does not work on AMD CPUs. On an AMD
-Hackintosh, or in a macOS guest on an AMD server, that rules out Docker
-Desktop, OrbStack, Colima and current VirtualBox: there is nothing to
-install that fixes it.
+Running a virtual machine normally depends on the operating system's vendor:
+the hypervisor is part of their kernel, and if they do not provide one for
+your hardware, nothing you install will change that. Graft is a hypervisor
+you bring yourself. It is [NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/),
+the hypervisor of NetBSD and DragonFly BSD, on a thin layer that asks the
+host for very little: memory it can pin, a way to share a buffer with a
+process, a way to run a function on every CPU, and locks. Port that layer
+and the rest comes with it, including a small machine monitor that boots
+Linux and runs containers.
 
-Graft takes [NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/), the
-hypervisor of NetBSD and DragonFly BSD, and grafts it onto macOS as a kernel
-extension. NVMM implements AMD-V itself, so nothing is needed from Apple. On
-top of it sit a small virtual machine monitor and a script that turn it into
-a Docker host:
+| | Today | Not yet |
+| --- | --- | --- |
+| Processors | AMD (AMD-V) | Intel: NVMM has the engine upstream, and it has not been brought through the layer. Arm: there is no engine |
+| Hosts | macOS, as a kernel extension; and a bare test kernel that is no operating system at all | Any other system |
+| Guests | Linux, booted directly | Anything that needs firmware |
+
+The first host is macOS on AMD, because that is a gap with no other fix:
+Apple's Hypervisor framework does not work on AMD CPUs, which on an AMD
+Hackintosh, or in a macOS guest on an AMD server, rules out Docker Desktop,
+OrbStack, Colima and current VirtualBox. With Graft:
 
 ```sh
 nvmm-docker start
