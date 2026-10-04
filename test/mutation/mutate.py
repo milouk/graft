@@ -9,7 +9,7 @@ not notice is reported as NOT DETECTED, and that is a gap in the tests.
 The working tree must be clean for the files being mutated; every mutation is
 reverted with `git checkout` afterwards.
 
-Usage:  ./test/mutation/mutate.py
+Usage:  ./test/mutation/mutate.py [text]     (only mutations whose name has it)
 """
 import subprocess
 import sys
@@ -66,10 +66,10 @@ MUTATIONS = [
      "\tx86_set_dr0(pc->dr[0]);\n\tx86_set_dr1(pc->dr[1]);", "\tx86_set_dr1(pc->dr[1]);"),
     ("run loop: every exit bounced to userland", "src/x86/nvmm_x86_svm.c",
      "\t\tif (host_intr || ++inkernel_exits >= NVMM_PORT_EXIT_BUDGET) {",
-     "\t\tif (1) {"),
+     "\t\tif (host_intr || ++inkernel_exits >= 1) {"),
     ("run loop: no cap on exits handled in a row", "src/x86/nvmm_x86_svm.c",
      "\t\tif (host_intr || ++inkernel_exits >= NVMM_PORT_EXIT_BUDGET) {",
-     "\t\tif (host_intr) {"),
+     "\t\tif (host_intr || ++inkernel_exits >= (1U << 30)) {"),
     ("sleep/wake: vCPU allowed to run while suspended", "src/x86/nvmm_x86_svm.c",
      "\t\t\tif (__predict_false(svm_suspended)) {", "\t\t\tif (0) {"),
     ("sleep/wake: SVM not re-enabled on resume", "src/x86/nvmm_x86_svm.c",
@@ -87,6 +87,8 @@ KNOWN_BLIND = [
      "src/x86/nvmm_x86_svm.c",
      "\tmachgen = os_vmspace_gen(mach->vm);", "\tmachgen = cpudata->vcpu_htlb_gen;"),
 ]
+
+ONLY = sys.argv[1] if len(sys.argv) > 1 else ""
 
 MARKERS = ("FAIL test", "PANIC", "TRAP", "unexpected exit", "LINK FAILED")
 
@@ -113,7 +115,7 @@ def main():
         sys.exit("refusing to run: src/ or port/ has uncommitted changes:\n" + dirty)
 
     undetected = invalid = 0
-    for name, path, old, new in MUTATIONS + KNOWN_BLIND:
+    for name, path, old, new in [m for m in MUTATIONS + KNOWN_BLIND if not ONLY or ONLY in m[0]]:
         blind = (name, path, old, new) in KNOWN_BLIND
         src = open(path).read()
         if src.count(old) != 1:
