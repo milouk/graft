@@ -100,7 +100,8 @@ get_gpr(int reg)
 struct host_state {
 	uint64_t fsbase, gsbase, kgsbase;
 	uint64_t star, lstar, cstar, sfmask;
-	uint64_t efer, cr0, cr3, cr4, xcr0, dr7;
+	uint64_t efer, cr0, cr3, cr4, xcr0;
+	uint64_t dr0, dr1, dr2, dr3, dr7;
 	uint16_t tr, ldt, ds, es, fs, gs;
 };
 
@@ -119,6 +120,10 @@ host_state_read(struct host_state *h)
 	h->cr3 = x86_get_cr3();
 	h->cr4 = x86_get_cr4();
 	h->xcr0 = (x86_xsave_features != 0) ? x86_get_xcr(0) : 0;
+	h->dr0 = x86_get_dr0();
+	h->dr1 = x86_get_dr1();
+	h->dr2 = x86_get_dr2();
+	h->dr3 = x86_get_dr3();
 	h->dr7 = x86_get_dr7();
 	__asm volatile ("str %0" : "=r" (h->tr));
 	__asm volatile ("sldt %0" : "=r" (h->ldt));
@@ -139,6 +144,17 @@ host_state_seed(void)
 	wrmsr(MSR_LSTAR, 0xFFFFFFFF80444000ULL);
 	wrmsr(MSR_CSTAR, 0xFFFFFFFF80555000ULL);
 	wrmsr(MSR_SFMASK, 0x0000000000047700ULL);
+
+	/*
+	 * Four armed execution breakpoints on addresses nothing ever runs.
+	 * A host debugger's breakpoints must survive a guest run; with DR7
+	 * left at its reset value there would be nothing to lose.
+	 */
+	x86_set_dr0(0x00007F0000001000ULL);
+	x86_set_dr1(0x00007F0000002000ULL);
+	x86_set_dr2(0x00007F0000003000ULL);
+	x86_set_dr3(0x00007F0000004000ULL);
+	x86_set_dr7(0x00000455ULL);
 }
 
 static struct nvmm_vcpu_exit *
@@ -167,6 +183,10 @@ run(void)
 	CHECK_EQ(after.cr3, before.cr3);
 	CHECK_EQ(after.cr4, before.cr4);
 	CHECK_EQ(after.xcr0, before.xcr0);
+	CHECK_EQ(after.dr0, before.dr0);
+	CHECK_EQ(after.dr1, before.dr1);
+	CHECK_EQ(after.dr2, before.dr2);
+	CHECK_EQ(after.dr3, before.dr3);
 	CHECK_EQ(after.dr7, before.dr7);
 	CHECK_EQ(after.tr, before.tr);
 	CHECK_EQ(after.ldt, before.ldt);

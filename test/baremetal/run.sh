@@ -20,22 +20,23 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 	docker build -q -t "$IMAGE" "$ROOT/test/baremetal/docker" >/dev/null
 fi
 
-# Link first, as its own step: a link failure must never be mistaken for a
-# test result.
-docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" \
-	ld.lld -m elf_x86_64 -nostdlib -static -z max-page-size=4096 \
-	    -T test/baremetal/linker.ld -o build/bare/nvmm-test.elf \
-	    $(cd "$ROOT" && ls build/bare/*.o)
-
+# The objects and the linker script are streamed into the container rather than
+# bind-mounted: Docker's file sharing can lag behind a build that just
+# finished, and the linker then sees half-written files.
 LOG="$ROOT/build/bare/nvmm-test.log"
 set +e
-docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" \
-	timeout 180 qemu-system-x86_64 \
-	    -machine q35 -accel tcg -cpu "$CPU" -m 512 \
+(cd "$ROOT" && tar -cf - test/baremetal/linker.ld build/bare/*.o) |
+docker run --rm -i "$IMAGE" sh -c '
+	mkdir /work && cd /work && tar -xf - || exit 90
+	ld.lld -m elf_x86_64 -nostdlib -static -z max-page-size=4096 \
+	    -T test/baremetal/linker.ld -o /work/nvmm-test.elf \
+	    build/bare/*.o || { echo "LINK FAILED"; exit 91; }
+	exec timeout 180 qemu-system-x86_64 \
+	    -machine q35 -accel tcg -cpu "$0" -m 512 \
 	    -display none -serial stdio -monitor none -no-reboot \
 	    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-	    -kernel build/bare/nvmm-test.elf "$@" 2>&1 | tee "$LOG" |
-	grep -v "TCG doesn't support requested feature"
+	    -kernel /work/nvmm-test.elf "$@"
+' "$CPU" "$@" 2>&1 | tee "$LOG" | grep -v "TCG doesn.t support requested feature"
 set -e
 
 # The kernel prints this line only after every check has passed, and then asks

@@ -51,11 +51,13 @@ bare: $(BARE_OBJS)
 
 $(BARE_DIR)/%.o: %.c
 	@mkdir -p $(BARE_DIR)
-	$(CC) $(BARE_CFLAGS) -c $< -o $@
+	$(CC) $(BARE_CFLAGS) -MMD -MP -c $< -o $@
 
 $(BARE_DIR)/%.o: %.S
 	@mkdir -p $(BARE_DIR)
-	$(CC) $(BARE_CFLAGS) -c $< -o $@
+	$(CC) $(BARE_CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(BARE_OBJS:.o=.d)
 
 test-bare: bare
 	./test/baremetal/run.sh
@@ -86,15 +88,17 @@ kext: $(KEXT_BUNDLE)/Contents/MacOS/NVMM
 
 $(KEXT_DIR)/%.o: %.c
 	@mkdir -p $(KEXT_DIR)
-	$(CC) $(KEXT_CFLAGS) -c $< -o $@
+	$(CC) $(KEXT_CFLAGS) -MMD -MP -c $< -o $@
 
 $(KEXT_DIR)/%.o: %.S
 	@mkdir -p $(KEXT_DIR)
-	$(CC) $(KEXT_CFLAGS) -c $< -o $@
+	$(CC) $(KEXT_CFLAGS) -MMD -MP -c $< -o $@
 
 $(KEXT_DIR)/%.o: %.cpp
 	@mkdir -p $(KEXT_DIR)
-	clang++ $(KEXT_CXXFLAGS) -c $< -o $@
+	clang++ $(KEXT_CXXFLAGS) -MMD -MP -c $< -o $@
+
+-include $(KEXT_OBJS:.o=.d)
 
 $(KEXT_BUNDLE)/Contents/MacOS/NVMM: $(KEXT_OBJS) darwin/Info.plist
 	@mkdir -p $(KEXT_BUNDLE)/Contents/MacOS
