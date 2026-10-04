@@ -64,7 +64,7 @@ flowchart TB
         cli["docker / nerdctl / podman"]
         gv["gvproxy<br/>network, port and socket forwarding"]
         subgraph vmm["graft-run"]
-            dev["serial, timers, interrupt controllers,<br/>virtio disk and network"]
+            dev["serial, timers, interrupt controllers,<br/>virtio disk, network and file sharing"]
             lib["libnvmm"]
         end
     end
@@ -156,6 +156,31 @@ vmm/graft stop
 
 `GRAFT_CPUS` and `GRAFT_MEM` size the VM.
 
+### Files
+
+Your home directory is visible in the VM at the same path, so a bind mount
+means what it means on the host:
+
+```sh
+cd ~/src/site
+graft nerdctl run --rm -v "$PWD:/site" -w /site node:alpine npm test
+```
+
+```mermaid
+flowchart LR
+    c["container<br/>/site"] -- "bind mount" --> g["VM<br/>/Users/you/src/site"]
+    g -- "9P over virtio" --> s["graft-run<br/>file server"]
+    s --> h["Mac<br/>/Users/you/src/site"]
+```
+
+Files keep their mode, and belong to whichever user in the container looks
+at them, so non-root containers can write and tools that insist on private
+files (SSH keys) are satisfied. `GRAFT_SHARE` shares another directory, or
+nothing when empty.
+
+The VM's own root is a compressed read-only image; images, containers and
+volumes live on a separate data disk, which survives replacing it.
+
 ## Container runtimes
 
 What the VM runs containers with is chosen when the image is built, with
@@ -231,13 +256,14 @@ flowchart LR
 ### The machine graft-run provides
 
 A 16550 serial port, the 8259 interrupt controllers, an 8254 timer, a CMOS
-clock, and virtio block and network devices on the memory-mapped transport.
+clock, and virtio block, network and 9P devices on the memory-mapped
+transport.
 With more than one CPU, each gets a local APIC and its own thread, and the
 machine an I/O APIC, described by an MP table.
 
 ```sh
-build/graft-run -k vmlinuz-virt -i initramfs-graft -d rootfs.img -c 4 -m 2048 \
-    -n /path/to/gvproxy.sock -a "root=/dev/vda rootfstype=ext4 modules=ext4"
+build/graft-run -k vmlinuz-virt -i initramfs-graft -d root.squashfs -d data.img \
+    -c 4 -m 2048 -n /path/to/gvproxy.sock -s "$HOME" -a "$(cat cmdline)"
 ```
 
 ## How it is tested
@@ -307,7 +333,8 @@ imported code.
 - AMD only. NVMM has an Intel engine; it has not been brought through the
   layer.
 - Linux guests only, booted directly.
-- No file sharing yet: `-v /a/mac/path:...` has nothing to mount.
+- Shared files do not deliver change notifications (inotify) to the guest,
+  so file watchers there need polling.
 - Published ports are forwarded for TCP only.
 - macOS's vmnet is supported by `graft-run -n vmnet` but networking normally
   goes through gvproxy, which needs no privileges.

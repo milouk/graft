@@ -61,5 +61,28 @@ if [ -n "$FLAVOR_CLI" ]; then
 	"$ND" "$FLAVOR_CLI" rm -f graft-test-web2 > /dev/null 2>&1 || true
 fi
 
+# A directory of this Mac, bind-mounted by its own path: through graft-run's
+# file server and back. Skipped when nothing is shared.
+if [ -n "${GRAFT_SHARE-$HOME}" ]; then
+	T=$(mktemp -d "${GRAFT_SHARE-$HOME}/.graft-test.XXXXXX")
+	echo "from the mac" > "$T/in.txt"
+	dd if=/dev/urandom of="$T/big" bs=1048576 count=64 2> /dev/null
+	bind_mount() {	# bind_mount <runtime command...>
+		"$@" run --rm -v "$T:/data" alpine sh -c \
+		    'cat /data/in.txt && echo from a container > /data/out.txt &&
+		     sha256sum < /data/big > /data/big.sum' | grep -q "from the mac" &&
+		    grep -q container "$T/out.txt" &&
+		    [ "$(shasum -a 256 < "$T/big")" = "$(cat "$T/big.sum")" ]
+	}
+	check "the VM has the directory at the same path" \
+	    "$ND" ssh "grep -q mac '$T/in.txt'"
+	[ -n "$FLAVOR_SOCKET" ] &&
+	    check "docker client: a bind mount of a Mac directory" bind_mount "$DOCKER"
+	[ -n "$FLAVOR_CLI" ] &&
+	    check "$FLAVOR_CLI in the VM: a bind mount of a Mac directory" \
+	    bind_mount "$ND" "$FLAVOR_CLI"
+	rm -rf "$T"
+fi
+
 "$ND" ssh "dmesg | grep -i -E 'soft lockup|rcu.*stall|BUG:' | head -5"
 [ $fail -eq 0 ] && echo "VM TEST PASSED ($FLAVOR)" || { echo "VM TEST FAILED ($FLAVOR)"; exit 1; }

@@ -1,26 +1,35 @@
 #!/usr/bin/expect -f
 #
-# build-image.exp — make what graft-run boots: a root filesystem image
-# (Alpine Linux with Docker and two container images), an initramfs that can
-# mount it, and an SSH key (id_graft) that the image accepts for root.
+# build-image.exp — make what graft-run boots, in a directory:
+#
+#   root.squashfs    the VM's root filesystem: Alpine Linux and a container
+#                    runtime, compressed and read-only
+#   data.img         its /var/lib: images, containers, volumes
+#   initramfs-graft  an initramfs that can mount both
+#   cmdline          what the kernel has to be told
+#   flavor.env       how the runtime is reached; read by vmm/graft
+#   id_graft         an SSH key the VM accepts for root
 #
 #   ./build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>
 #
 # This is a build tool, not part of running a VM. It boots the Alpine ISO in
 # QEMU and runs vmm/guest-build.sh inside it. The script reaches the guest as
-# a disk, and the initramfs comes back out through another, because the host
+# a disk, and the results come back out through another, because the host
 # cannot read a Linux filesystem; so the only thing typed at the guest is a
 # login and one command.
 #
-# QEMU's software emulation is the default: no driver, no root, a quarter of
-# an hour. ACCEL=nvmm in the environment takes a minute or two. FLAVOR picks
-# what the image runs containers with: the name of a file in flavors/,
-# "containerd" by default. Adding a runtime is adding a file there. IMAGES
-# names container images to pull into the image as it is built, so that they
-# are there without a network; none by default. SIZE sets the
-# size of the root filesystem (default 4G). The Alpine release in
-# guest-build.sh must match the ISO, whose kernel modules the image uses;
-# graft-run must then boot that same kernel (the ISO's boot/vmlinuz-virt).
+# In the environment:
+#   ACCEL   QEMU's accelerator. The default, software emulation, needs no
+#           driver and no root and is slow; "nvmm" is quick.
+#   FLAVOR  what the VM runs containers with: the name of a file in flavors/,
+#           "containerd" by default. Adding a runtime is adding a file there.
+#   IMAGES  container images to pull into data.img as it is built, so that
+#           they are there without a network. None by default.
+#   SIZE    the size of data.img (default 8G; it only takes the space used).
+#
+# The Alpine release in guest-build.sh must match the ISO, whose kernel
+# modules the image uses, and graft-run must boot that same kernel: the
+# vmlinuz-virt in the release's netboot directory.
 
 if {$argc != 3} {
     puts "usage: build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>"
@@ -34,14 +43,15 @@ encoding system iso8859-1
 
 set accel tcg
 if {[info exists env(ACCEL)]} { set accel $env(ACCEL) }
-set size 4G
+set size 8G
 if {[info exists env(SIZE)]} { set size $env(SIZE) }
 set flavor containerd
 if {[info exists env(FLAVOR)]} { set flavor $env(FLAVOR) }
 
 set outdir [file normalize $outdir]
 set here [file dirname [file normalize [info script]]]
-set rootfs $outdir/rootfs.img
+set data $outdir/data.img
+set rootfs $outdir/root.squashfs
 set initramfs $outdir/initramfs-graft
 set script $outdir/build-script.img
 set scratch $outdir/build-scratch.img
@@ -56,10 +66,12 @@ if {![file exists $ffile]} {
     exit 2
 }
 file mkdir $outdir
-file delete -force $sock $rootfs $script $scratch
+file delete -force $sock $rootfs $data $script $scratch
 
-exec $qimg create -f raw $rootfs $size
-exec $qimg create -f raw $scratch 64M
+# The first disk is where the tree is put together; it ends up as the data
+# disk. The scratch disk carries the initramfs and the squashfs out.
+exec $qimg create -f raw $data $size
+exec $qimg create -f raw $scratch 1G
 # A key pair for the host to reach the VM with. Kept if it is already there,
 # so that rebuilding the image does not lock out a running setup's key.
 set key $outdir/id_graft
@@ -81,7 +93,7 @@ exec sh -c "printf 'PUBKEY=\"%s\"\nIMAGES=\"%s\"\n' '$pubkey' '$images' > '$scri
 
 set qpid [exec $qemu -accel $accel -M q35 -m 2G -display none \
     -monitor none -serial unix:$sock,server=on,wait=off -cdrom $iso \
-    -drive file=$rootfs,if=virtio,format=raw \
+    -drive file=$data,if=virtio,format=raw \
     -drive file=$script,if=virtio,format=raw,readonly=on \
     -drive file=$scratch,if=virtio,format=raw \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
@@ -110,9 +122,11 @@ after 2000
 send "sh /dev/vdb\r"
 
 set isize 0
+set ssize 0
 set timeout 3600
 expect {
     -re {@@INITRAMFS-SIZE:([0-9]+)@@} { set isize $expect_out(1,string); exp_continue }
+    -re {@@SQUASHFS-SIZE:([0-9]+)@@} { set ssize $expect_out(1,string); exp_continue }
     -re {@@RESULT:([0-9]+)@@} {
         if {$expect_out(1,string) != 0} { fail "the build failed inside the guest" }
     }
@@ -127,10 +141,16 @@ set timeout 120
 expect eof
 for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
 
-if {$isize <= 0} { puts "### no initramfs size reported"; exit 1 }
+if {$isize <= 0 || $ssize <= 0} { puts "### sizes not reported"; exit 1 }
 exec head -c $isize $scratch > $initramfs
+# The squashfs starts SQUASHFS_AT megabytes in; see guest-build.sh.
+exec sh -c "dd if='$scratch' bs=1048576 skip=64 2>/dev/null | head -c $ssize > '$rootfs'"
+# What the kernel has to be told to boot this image.
+set fh [open $outdir/cmdline w]
+puts $fh "root=/dev/vda rootfstype=squashfs overlaytmpfs=yes modules=squashfs,overlay,ext4 quiet"
+close $fh
 file delete -force $script $scratch $sock
 # What graft needs to know about the image, in a form it can source.
 exec sh -c ". '$ffile'; printf 'FLAVOR=%s\nFLAVOR_SOCKET=%s\nFLAVOR_CLI=%s\n' \
     '$flavor' \"\$FLAVOR_SOCKET\" \"\$FLAVOR_CLI\" > '$outdir/flavor.env'"
-puts "\n### built $rootfs ($flavor) and $initramfs ($isize bytes); key in $key"
+puts "\n### built $rootfs ($flavor, $ssize bytes), $data and $initramfs; key in $key"

@@ -11,7 +11,7 @@
  * With more (-c), each CPU gets a local APIC and the machine an I/O APIC,
  * described to the kernel by an MP table, and each CPU runs on a thread.
  *
- * A disk, if given, is a virtio block device: the kernel finds it through
+ * Each disk given is a virtio block device: the kernel finds it through
  * its command line, which is how virtio's memory-mapped transport is used
  * on machines with no firmware tables to describe it.
  *
@@ -21,9 +21,12 @@
  * on the socket backend below). Either way the guest gets its address by
  * DHCP and a route out, with nothing to configure.
  *
+ * A directory of the host can be shared with the guest (-s): it appears
+ * there as a 9p filesystem to mount, served by p9.c.
+ *
  * Usage (needs /dev/nvmm):
- *   graft-run -k vmlinuz [-i initramfs] [-d disk.img] [-n vmnet|socket]
- *            [-c cpus] [-m megabytes] [-a "extra cmdline"]
+ *   graft-run -k vmlinuz [-i initramfs] [-d disk.img]... [-n vmnet|socket]
+ *            [-s directory] [-c cpus] [-m megabytes] [-a "extra cmdline"]
  *
  * The console is this terminal. Ctrl-A then x quits.
  */
@@ -53,6 +56,8 @@
 #include <vmnet/vmnet.h>
 
 #include <nvmm.h>
+
+#include "p9.h"
 
 /* -------------------------------------------------------------------------- */
 /* Guest memory layout. */
@@ -728,13 +733,14 @@ cmos_read(void)
 
 #define VIRTIO_BASE	0xD0000000ULL
 #define VIRTIO_STRIDE	0x1000ULL
-#define VIRTIO_MAXDEV	4
+#define VIRTIO_MAXDEV	6
 #define VQ_MAX		256
 #define VQ_IOV_MAX	(VQ_MAX + 2)
 
 #define VIRTIO_F_VERSION_1	(1ULL << 32)
 #define VIRTIO_ID_NET		1
 #define VIRTIO_ID_BLOCK		2
+#define VIRTIO_ID_9P		9
 
 struct virtq {
 	uint32_t num;
@@ -755,11 +761,14 @@ struct virtio_dev {
 	int fd;				/* block: the image */
 	pthread_t worker;		/* block: the thread that does the I/O */
 	unsigned long resets;		/* times the guest has reset the device */
+	struct p9 *p9;			/* shared directory: its file server */
 	size_t max_packet;		/* network: largest frame */
 };
 
 static struct virtio_dev vdevs[VIRTIO_MAXDEV];
 static unsigned int nvdevs;
+/* ISA lines nothing else here uses, one per device. */
+static const int virtio_irqs[VIRTIO_MAXDEV] = { 5, 6, 7, 10, 11, 12 };
 
 /* Guest memory, bounds checked. NULL if any of it is not RAM. */
 static void *
@@ -803,7 +812,7 @@ vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
 		struct vq_desc d;
 
 		if (i >= q->num || n == VQ_IOV_MAX)
-			return -1;
+			goto bad;
 		/*
 		 * A copy: the guest's other CPUs can rewrite the descriptor
 		 * between a check of it and its use.
@@ -812,10 +821,10 @@ vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
 		iov[n].iov_base = gpa_ptr(d.addr, d.len);
 		iov[n].iov_len = d.len;
 		if (iov[n].iov_base == NULL)
-			return -1;
+			goto bad;
 		if ((d.flags & VQ_DESC_F_WRITE) == 0) {
 			if (*nout != n)
-				return -1;	/* readable after writable */
+				goto bad;	/* readable after writable */
 			(*nout)++;
 		}
 		n++;
@@ -825,6 +834,10 @@ vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
 	}
 	q->last_avail++;
 	return (int)n;
+bad:
+	/* Skipped, not retried: it would be no better the next time. */
+	q->last_avail++;
+	return -1;
 }
 
 /* Hand a request back, 'len' bytes of it written by the device. */
@@ -1083,7 +1096,7 @@ blk_add(const char *path, char *cmdline, size_t cmdlen)
 	sectors = (uint64_t)st.st_size / 512;
 
 	d->id = VIRTIO_ID_BLOCK;
-	d->irq = 5 + (int)nvdevs;
+	d->irq = virtio_irqs[nvdevs];
 	d->features = VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX |
 	    VIRTIO_BLK_F_FLUSH;
 	d->notify = blk_notify;
@@ -1097,6 +1110,127 @@ blk_add(const char *path, char *cmdline, size_t cmdlen)
 
 	if (pthread_create(&d->worker, NULL, blk_worker, d) != 0)
 		die("cannot start the disk thread");
+}
+
+/* ---- a shared directory ---- */
+
+/*
+ * The guest mounts it with
+ *   mount -t 9p -o trans=virtio,version=9p2000.L <tag> <where>
+ * and every operation on a file there arrives as one request: the message
+ * in the buffers the device reads, the reply in those it writes. As for the
+ * disk, a thread of the device's own answers them, without the lock while
+ * it is in the host's filesystem.
+ */
+#define P9_TAG	"share0"
+
+static pthread_cond_t p9_cond = PTHREAD_COND_INITIALIZER;
+
+static void
+share_notify(struct virtio_dev *d, unsigned int qi)
+{
+	(void)d;
+	(void)qi;
+	pthread_cond_broadcast(&p9_cond);
+}
+
+static void *
+share_worker(void *arg)
+{
+	static struct iovec iov[VQ_IOV_MAX];
+	struct virtio_dev *d = arg;
+	struct virtq *q = &d->vq[0];
+	uint8_t *req, *rep;
+	unsigned long resets;
+	unsigned int nout;
+	uint16_t head;
+	int n, i;
+
+	req = malloc(P9_MSIZE_MAX);
+	rep = malloc(P9_MSIZE_MAX);
+	if (req == NULL || rep == NULL)
+		die("out of memory");
+
+	pthread_mutex_lock(&big);
+	while (running) {
+		size_t len = 0, cap = 0, replen, done = 0;
+
+		n = q->ready ? vq_pop(q, iov, &nout, &head) : 0;
+		if (n < 0) {
+			fprintf(stderr,
+			    "[virtio-9p: bad request from the guest]\r\n");
+			n = 0;
+		}
+		if (n == 0) {
+			struct timespec ts;
+			struct timeval tv;
+
+			gettimeofday(&tv, NULL);
+			ts.tv_sec = tv.tv_sec + 1;
+			ts.tv_nsec = tv.tv_usec * 1000;
+			(void)pthread_cond_timedwait(&p9_cond, &big, &ts);
+			continue;
+		}
+		resets = d->resets;
+		pthread_mutex_unlock(&big);
+
+		/* Gather the request; a message too long is cut, and refused. */
+		for (i = 0; i < (int)nout; i++) {
+			size_t l = iov[i].iov_len;
+
+			if (l > P9_MSIZE_MAX - len)
+				l = P9_MSIZE_MAX - len;
+			memcpy(req + len, iov[i].iov_base, l);
+			len += l;
+		}
+		for (i = (int)nout; i < n; i++)
+			cap += iov[i].iov_len;
+		if (cap > P9_MSIZE_MAX)
+			cap = P9_MSIZE_MAX;
+		replen = p9_request(d->p9, req, len, rep, cap);
+
+		for (i = (int)nout; i < n && done < replen; i++) {
+			size_t l = iov[i].iov_len;
+
+			if (l > replen - done)
+				l = replen - done;
+			memcpy(iov[i].iov_base, rep + done, l);
+			done += l;
+		}
+
+		pthread_mutex_lock(&big);
+		if (q->ready && d->resets == resets)
+			vq_push(d, q, head, (uint32_t)done);
+	}
+	pthread_mutex_unlock(&big);
+	return NULL;
+}
+
+static void
+share_add(const char *path, char *cmdline, size_t cmdlen)
+{
+	struct virtio_dev *d = &vdevs[nvdevs];
+	const uint16_t taglen = (uint16_t)strlen(P9_TAG);
+
+	d->p9 = p9_new(path);
+	if (d->p9 == NULL)
+		die("%s: not a directory that can be shared", path);
+	/* The guest has applied its own mask to the modes it asks for. */
+	(void)umask(0);
+	d->id = VIRTIO_ID_9P;
+	d->irq = virtio_irqs[nvdevs];
+	d->features = VIRTIO_F_VERSION_1 | 1;		/* has a mount tag */
+	d->notify = share_notify;
+	memcpy(d->config, &taglen, 2);
+	memcpy(d->config + 2, P9_TAG, taglen);
+
+	snprintf(cmdline + strlen(cmdline), cmdlen - strlen(cmdline),
+	    " virtio_mmio.device=4K@%#llx:%d",
+	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
+	nvdevs++;
+
+	if (pthread_create(&d->worker, NULL, share_worker, d) != 0)
+		die("cannot start the file-sharing thread");
 }
 
 /* ---- the network card ---- */
@@ -1213,7 +1347,7 @@ net_finish(struct virtio_dev *d, const uint8_t *mac, char *cmdline,
     size_t cmdlen)
 {
 	d->id = VIRTIO_ID_NET;
-	d->irq = 5 + (int)nvdevs;
+	d->irq = virtio_irqs[nvdevs];
 	d->features = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC;
 	d->notify = net_notify;
 	memcpy(d->config, mac, 6);
@@ -2700,15 +2834,18 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: graft-run -k vmlinuz [-i initramfs] "
-	    "[-d disk.img] [-n vmnet|socket] [-c cpus]\n"
-	    "                [-m megabytes] [-a \"extra cmdline\"] [-v]\n");
+	    "[-d disk.img]... [-n vmnet|socket]\n"
+	    "                 [-s directory] [-c cpus] [-m megabytes] "
+	    "[-a \"extra cmdline\"] [-v]\n");
 	exit(2);
 }
 
 int
 main(int argc, char **argv)
 {
-	const char *kpath = NULL, *ipath = NULL, *dpath = NULL, *extra = "";
+	const char *kpath = NULL, *ipath = NULL, *extra = "";
+	const char *dpaths[VIRTIO_MAXDEV], *share = NULL;
+	unsigned int ndisks = 0;
 	const char *net = NULL;
 	struct nvmm_assist_callbacks cbs = { io_callback, mem_callback };
 	struct nvmm_vcpu_conf_cpuid cpuid;
@@ -2721,12 +2858,17 @@ main(int argc, char **argv)
 	long mb = 512, n = 1;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:d:n:c:m:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:n:s:c:m:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
-		case 'd': dpath = optarg; break;
+		case 'd':
+			if (ndisks == VIRTIO_MAXDEV - 2)
+				usage();
+			dpaths[ndisks++] = optarg;
+			break;
 		case 'n': net = optarg; break;
+		case 's': share = optarg; break;
 		case 'c': n = atol(optarg); break;
 		case 'm': mb = atol(optarg); break;
 		case 'a': extra = optarg; break;
@@ -2807,14 +2949,17 @@ main(int argc, char **argv)
 	/* A network helper that goes away is an error on write, not a death. */
 	signal(SIGPIPE, SIG_IGN);
 
-	if (dpath != NULL)
-		blk_add(dpath, cmdline, sizeof(cmdline));
+	/* In the order given: the first is /dev/vda, the next /dev/vdb. */
+	for (i = 0; i < ndisks; i++)
+		blk_add(dpaths[i], cmdline, sizeof(cmdline));
 	if (net != NULL && strcmp(net, "vmnet") == 0)
 		net_add_vmnet(cmdline, sizeof(cmdline));
 	else if (net != NULL && strcmp(net, "unplugged") == 0)
 		net_add_unplugged(cmdline, sizeof(cmdline));
 	else if (net != NULL)
 		net_add_socket(net, cmdline, sizeof(cmdline));
+	if (share != NULL)
+		share_add(share, cmdline, sizeof(cmdline));
 	snprintf(cmdline + strlen(cmdline), sizeof(cmdline) - strlen(cmdline),
 	    " %s", extra);
 

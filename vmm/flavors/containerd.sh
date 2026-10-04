@@ -27,7 +27,9 @@ flavor_setup() {
 }
 
 flavor_pull() {
-	containerd --root /mnt/var/lib/containerd > /tmp/daemon.log 2>&1 &
+	varlib=$1
+	shift
+	containerd --root "$varlib/containerd" > /tmp/daemon.log 2>&1 &
 	for i in $(seq 60); do nerdctl info > /dev/null 2>&1 && break; sleep 2; done
 	nerdctl info > /dev/null
 	for img in "$@"; do nerdctl pull -q "$img"; done

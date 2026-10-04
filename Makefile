@@ -28,8 +28,13 @@ check: unit test-bare kext
 UNIT_CFLAGS	:= -std=c11 -g -Wall -Wextra -Werror \
 		   -fsanitize=address,undefined -Iport
 
-unit: $(BUILD)/npt_test
+unit: $(BUILD)/npt_test $(BUILD)/p9_test
 	$(BUILD)/npt_test
+	$(BUILD)/p9_test
+
+$(BUILD)/p9_test: test/unit/p9_test.c vmm/p9.c vmm/p9.h
+	@mkdir -p $(BUILD)
+	$(CC) $(UNIT_CFLAGS) -Ivmm -o $@ test/unit/p9_test.c vmm/p9.c
 
 $(BUILD)/npt_test: test/unit/npt_test.c port/npt.c port/npt.h
 	@mkdir -p $(BUILD)
@@ -196,9 +201,9 @@ $(LIBNVMM): lib/libnvmm.c lib/libnvmm_x86.c lib/libnvmm_darwin.h $(LIB_HEADERS)
 # A small VMM in place of QEMU: boots a Linux kernel directly.
 VMM_TOOL	:= $(BUILD)/graft-run
 vmm: $(VMM_TOOL)
-$(VMM_TOOL): vmm/graft-run.c $(LIBNVMM)
+$(VMM_TOOL): vmm/graft-run.c vmm/p9.c vmm/p9.h $(LIBNVMM)
 	@mkdir -p $(BUILD)
-	$(CC) $(USER_CFLAGS) -o $@ vmm/graft-run.c $(LIBNVMM) -framework vmnet
+	$(CC) $(USER_CFLAGS) -Ivmm -o $@ vmm/graft-run.c vmm/p9.c $(LIBNVMM) -framework vmnet
 
 # The first real guests. Needs NVMM.kext loaded on an AMD machine.
 GUEST_TOOL	:= $(BUILD)/nvmm-guest-test

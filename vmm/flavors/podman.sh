@@ -2,7 +2,7 @@
 # on the host works against it, as does a podman client; and podman itself
 # can be run inside the VM.
 
-FLAVOR_PKGS="podman podman-openrc"
+FLAVOR_PKGS="podman podman-openrc iptables"
 FLAVOR_BUILD_PKGS="podman"
 FLAVOR_SERVICE=podman
 FLAVOR_SOCKET=/run/podman/podman.sock
@@ -15,7 +15,8 @@ flavor_setup() { :; }
 # would: a first component with a dot or a colon in it, or "localhost", is a
 # registry already.
 flavor_pull() {
-	store=/mnt/var/lib/containers/storage
+	store=$1/containers/storage
+	shift
 	for img in "$@"; do
 		case "$img" in
 		*/*)	case "${img%%/*}" in

@@ -12,7 +12,7 @@
 #
 # It needs, in $GRAFT_DIR (default ~/.graft), what
 # vmm/build-image.exp makes, plus the kernel: vmlinuz-virt, initramfs-graft,
-# rootfs.img, id_graft and flavor.env. And on the PATH, or named by $GRAFT_RUN
+# root.squashfs, data.img, cmdline, id_graft and flavor.env. And on the PATH, or named by $GRAFT_RUN
 # and $GVPROXY: graft-run and gvproxy. GRAFT_CPUS and GRAFT_MEM
 # (megabytes) size the VM; the defaults are one CPU and 2048.
 #
@@ -24,6 +24,11 @@
 #     gvproxy carries it to the VM over SSH, with the image's key.
 #   - A runtime with a command of its own (nerdctl, podman) can be run in the
 #     VM: "graft nerdctl run --rm alpine true".
+#
+# The VM sees this Mac's home directory, at the same path, so a bind mount
+# of something under it (-v "$PWD:/app") works as it would with containers
+# run here. GRAFT_SHARE names another directory, or nothing if empty. Paths
+# with spaces in them are not handled.
 #
 # Ports that containers publish (-p) appear on this Mac too, on the loopback
 # address; set GRAFT_BIND=0.0.0.0 to offer them to the network as
@@ -37,6 +42,8 @@ GVPROXY=${GVPROXY:-gvproxy}
 MEM=${GRAFT_MEM:-2048}
 CPUS=${GRAFT_CPUS:-1}
 SSH_PORT=${GRAFT_SSH_PORT:-2222}
+# What of this Mac the VM sees, at the same path. Empty: nothing.
+SHARE=${GRAFT_SHARE-"$HOME"}
 SOCK="$DIR/docker.sock"
 CTL="$DIR/ctl.sock"
 BIND=${GRAFT_BIND:-127.0.0.1}
@@ -57,6 +64,7 @@ vm_ssh() {
 	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
 	    root@127.0.0.1 "$@"
 }
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # Is the container runtime answering? Ask its socket if it has one.
 runtime_up() {
 	if [ -n "$FLAVOR_SOCKET" ]; then
@@ -108,7 +116,8 @@ start() {
 		echo "already running (pid $(vm_pid))"
 		return 0
 	fi
-	for f in vmlinuz-virt initramfs-graft rootfs.img id_graft flavor.env; do
+	for f in vmlinuz-virt initramfs-graft root.squashfs data.img cmdline \
+	    id_graft flavor.env; do
 		[ -f "$DIR/$f" ] || { echo "missing $DIR/$f" >&2; exit 1; }
 	done
 	[ -e /dev/nvmm ] || { echo "/dev/nvmm is not there; is NVMM.kext loaded?" >&2; exit 1; }
@@ -137,8 +146,10 @@ start() {
 	# comes from a pipe, which is how "stop" asks it to shut down.
 	mkfifo "$DIR/console.in"
 	"$GRAFT_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-graft" \
-	    -d "$DIR/rootfs.img" -n "$DIR/net.sock" -m "$MEM" -c "$CPUS" \
-	    -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet" \
+	    -d "$DIR/root.squashfs" -d "$DIR/data.img" \
+	    -n "$DIR/net.sock" -m "$MEM" -c "$CPUS" \
+	    ${SHARE:+-s "$SHARE"} \
+	    -a "$(cat "$DIR/cmdline")${SHARE:+ graft.share=$SHARE}" \
 	    0<> "$DIR/console.in" > "$DIR/console.log" 2>&1 &
 	echo $! > "$DIR/vm.pid"
 
@@ -201,11 +212,12 @@ ssh)	 shift; vm_ssh "$@" ;;
 "$FLAVOR_CLI")
 	# The runtime's own command, in the VM. ssh joins its arguments with
 	# spaces and the far shell splits them again, so each is quoted for
-	# that shell first.
-	cmd=$1
+	# that shell first. It runs in the directory this was called from,
+	# when the VM has it, so relative paths mean the same there.
+	cmd="cd $(quote "$PWD") 2>/dev/null; $1"
 	shift
 	for a in "$@"; do
-		cmd="$cmd '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
+		cmd="$cmd $(quote "$a")"
 	done
 	if [ -t 0 ]; then vm_ssh -t "$cmd"; else vm_ssh "$cmd"; fi ;;
 *)	 echo "usage: graft start|stop|status|console|ssh|<cli>" >&2; exit 2 ;;
