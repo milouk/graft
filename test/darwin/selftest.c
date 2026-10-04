@@ -12,6 +12,7 @@
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -103,6 +104,48 @@ map_roundtrip(int fd, uint64_t size, int fixed, uint32_t seed, int unmap)
 	}
 }
 
+/*
+ * Looking the device up must cost nothing and must never be able to hurt.
+ *
+ * devfs asks a cloning device for a minor number on every lookup of its node,
+ * and nothing is told when that number goes unused. An earlier version
+ * reserved a slot each time; sixteen lookups later it ran out, and the way
+ * devfs handles that left every further lookup of the node asleep for ever,
+ * which froze sudo and sshd. So: look it up far more often than there are
+ * slots, then check it still opens.
+ */
+static void
+lookup_storm(void)
+{
+	struct stat sb;
+	int fds[64], n, i, extra;
+
+	for (i = 0; i < 500; i++)
+		CHECK(lstat("/dev/nvmm-selftest", &sb) == 0);
+
+	/* Take every slot. The device has fewer than 64. */
+	for (n = 0; n < 64; n++) {
+		fds[n] = open("/dev/nvmm-selftest", O_RDWR);
+		if (fds[n] == -1)
+			break;
+	}
+	CHECK(n > 0 && n < 64);
+	CHECK(errno == EBUSY);
+	errno = 0;
+
+	/* Full is an error, not a hang, and lookups still work. */
+	extra = open("/dev/nvmm-selftest", O_RDWR);
+	CHECK(extra == -1 && errno == EBUSY);
+	errno = 0;
+	for (i = 0; i < 50; i++)
+		CHECK(lstat("/dev/nvmm-selftest", &sb) == 0);
+
+	for (i = 0; i < n; i++)
+		CHECK(close(fds[i]) == 0);
+	printf("device: 550 lookups, %d simultaneous opens, then refused "
+	    "cleanly\n", n);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -115,6 +158,9 @@ main(int argc, char **argv)
 		perror("/dev/nvmm-selftest");
 		return 2;
 	}
+
+	if (!leak)
+		lookup_storm();
 
 	if (leak) {
 		/* Leave a 64 MiB mapping behind; the kernel must clean up. */

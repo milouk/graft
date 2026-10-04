@@ -96,10 +96,12 @@ port_pages_alloc(size_t npages, void **va, uint64_t *pa)
 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size,
 	    0xFFFFFFFFFFFFF000ULL);
 	if (desc == NULL) {
+		printf("nvmm: no %zu contiguous page(s) available\n", npages);
 		IOFree(run, sizeof(*run));
 		return ENOMEM;
 	}
 	if (desc->prepare() != kIOReturnSuccess) {
+		printf("nvmm: cannot wire %zu page(s)\n", npages);
 		desc->release();
 		IOFree(run, sizeof(*run));
 		return ENOMEM;
@@ -107,6 +109,9 @@ port_pages_alloc(size_t npages, void **va, uint64_t *pa)
 
 	phys = desc->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
 	if (phys == 0 || seglen < size) {
+		printf("nvmm: %zu page(s) came back in a %llu-byte run at "
+		    "%#llx, wanted %zu bytes\n", npages,
+		    (unsigned long long)seglen, (unsigned long long)phys, size);
 		desc->complete();
 		desc->release();
 		IOFree(run, sizeof(*run));

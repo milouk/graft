@@ -284,6 +284,21 @@ port_panic(const char *fmt, ...)
  * closing it destroys them. A plain character device cannot tell one open
  * from another, so this is a cloning device: every open() gets a minor number
  * of its own, and close is delivered per minor.
+ *
+ * Two facts about devfs shape the clone function, both learned the hard way
+ * on a real machine:
+ *
+ *   - It is called on every LOOKUP of the node, not only on open. An lstat()
+ *     or an `ls /dev` calls it, and nothing is ever told that the minor it
+ *     returned went unused. So it must not reserve anything.
+ *
+ *   - It must never return -1. On that path devfs_dntovn() returns without
+ *     clearing DN_CREATE on the node, and every later lookup of it sleeps
+ *     for ever, taking sudo and sshd down with it.
+ *
+ * So the clone function only suggests a minor that is free right now, open()
+ * does the claiming, and "none free" is expressed as a minor that open()
+ * always refuses.
  */
 
 #define NVMM_MAXOPEN	64
@@ -301,17 +316,17 @@ darwin_nvmm_clone(dev_t dev __unused, int action)
 	if (action != DEVFS_CLONE_ALLOC)
 		return 0;
 
-	lck_mtx_lock(nvmm_dev_lock);
+	/*
+	 * Called with the devfs lock held. A racy read is fine: this is only a
+	 * suggestion, and open() checks again under nvmm_dev_lock.
+	 */
 	for (i = 0; i < NVMM_MAXOPEN; i++) {
-		if (nvmm_owners[i] == NULL) {
-			/* Reserve the slot; open() fills it in. */
-			nvmm_owners[i] = (struct nvmm_owner *)(uintptr_t)1;
+		if (nvmm_owners[i] == NULL)
 			break;
-		}
 	}
-	lck_mtx_unlock(nvmm_dev_lock);
 
-	return (i < NVMM_MAXOPEN) ? i : -1;
+	/* i == NVMM_MAXOPEN is the "all in use" minor; open() refuses it. */
+	return i;
 }
 
 static int
@@ -321,8 +336,10 @@ darwin_nvmm_open(dev_t dev, int flags, int devtype __unused, proc_t p)
 	struct nvmm_owner *owner = NULL;
 	int error = 0;
 
-	if (unit < 0 || unit >= NVMM_MAXOPEN)
+	if (unit < 0 || unit > NVMM_MAXOPEN)
 		return ENXIO;
+	if (unit == NVMM_MAXOPEN)
+		return EBUSY;	/* every slot was taken when this was looked up */
 
 	if (nvmm_impl == NULL) {
 		error = ENXIO;
@@ -339,18 +356,20 @@ darwin_nvmm_open(dev_t dev, int flags, int devtype __unused, proc_t p)
 			owner->pid = proc_pid(p);
 	}
 
-	if (error != 0) {
-		/* Give back the minor the clone step reserved for this open. */
-		lck_mtx_lock(nvmm_dev_lock);
-		nvmm_owners[unit] = NULL;
-		lck_mtx_unlock(nvmm_dev_lock);
+	if (error != 0)
 		return error;
-	}
 
+	/* Claim the minor. Another open may have been suggested the same one. */
 	lck_mtx_lock(nvmm_dev_lock);
-	nvmm_owners[unit] = owner;
+	if (nvmm_owners[unit] != NULL)
+		error = EBUSY;
+	else
+		nvmm_owners[unit] = owner;
 	lck_mtx_unlock(nvmm_dev_lock);
-	return 0;
+
+	if (error != 0 && owner != &nvmm_root_owner)
+		os_mem_free(owner, sizeof(*owner));
+	return error;
 }
 
 static int
@@ -368,7 +387,7 @@ darwin_nvmm_close(dev_t dev, int flags __unused, int devtype __unused,
 	nvmm_owners[unit] = NULL;
 	lck_mtx_unlock(nvmm_dev_lock);
 
-	if (owner == NULL || owner == (struct nvmm_owner *)(uintptr_t)1)
+	if (owner == NULL)
 		return 0;
 
 	nvmm_kill_machines(owner);
@@ -390,7 +409,7 @@ darwin_nvmm_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag __unused,
 	if (unit < 0 || unit >= NVMM_MAXOPEN)
 		return ENXIO;
 	owner = nvmm_owners[unit];
-	if (owner == NULL || owner == (struct nvmm_owner *)(uintptr_t)1)
+	if (owner == NULL)
 		return ENXIO;
 
 	return nvmm_ioctl(owner, cmd, data);

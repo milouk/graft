@@ -30,6 +30,8 @@ extern unsigned int real_ncpus;
 
 volatile unsigned int nvmm_selftest_sleeps;
 volatile unsigned int nvmm_selftest_wakes;
+/* How often devfs asked for a minor: once per lookup, not once per open. */
+static volatile unsigned int nvmm_selftest_lookups;
 
 /* -------------------------------------------------------------------------- */
 /* A tiny reporting harness. */
@@ -106,7 +108,11 @@ st_memory(struct st *st)
 
 	/* Several pages in one physically contiguous run, as a VMCB needs. */
 	va = NULL;
-	ST_CHECK(st, port_pages_alloc(4, &va, &pa) == 0);
+	i = (size_t)port_pages_alloc(4, &va, &pa);
+	if (i != 0)
+		st_log(st, "memory: 4 contiguous pages refused, error %d "
+		    "(see the kernel log)\n", (int)i);
+	ST_CHECK(st, i == 0);
 	if (va != NULL) {
 		b = va;
 		memset(va, 0x11, 4 * 4096);
@@ -344,6 +350,7 @@ selftest_run(struct nvmm_selftest_run *out)
 
 	out->sleeps = nvmm_selftest_sleeps;
 	out->wakes = nvmm_selftest_wakes;
+	st_log(&st, "device: %u lookups so far\n", nvmm_selftest_lookups);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -372,16 +379,17 @@ st_clone(dev_t dev __unused, int action)
 
 	if (action != DEVFS_CLONE_ALLOC)
 		return 0;
-	os_mtx_lock(&st_dev_lock);
+
+	/*
+	 * Only a suggestion; see the comment on the device in nvmm_darwin.c.
+	 * Never reserve here and never return -1.
+	 */
 	for (i = 0; i < ST_MAXOPEN; i++) {
-		if (!st_opens[i].used) {
-			memset(&st_opens[i], 0, sizeof(st_opens[i]));
-			st_opens[i].used = true;
+		if (!st_opens[i].used)
 			break;
-		}
 	}
-	os_mtx_unlock(&st_dev_lock);
-	return (i < ST_MAXOPEN) ? i : -1;
+	nvmm_selftest_lookups++;
+	return i;
 }
 
 static void
@@ -407,11 +415,23 @@ static int
 st_open(dev_t dev, int flags __unused, int devtype __unused, proc_t p)
 {
 	const int unit = minor(dev);
+	int error = 0;
 
-	if (unit < 0 || unit >= ST_MAXOPEN || !st_opens[unit].used)
+	if (unit < 0 || unit > ST_MAXOPEN)
 		return ENXIO;
-	st_opens[unit].pid = proc_pid(p);
-	return 0;
+	if (unit == ST_MAXOPEN)
+		return EBUSY;
+
+	os_mtx_lock(&st_dev_lock);
+	if (st_opens[unit].used) {
+		error = EBUSY;
+	} else {
+		memset(&st_opens[unit], 0, sizeof(st_opens[unit]));
+		st_opens[unit].used = true;
+		st_opens[unit].pid = proc_pid(p);
+	}
+	os_mtx_unlock(&st_dev_lock);
+	return error;
 }
 
 static int
@@ -420,8 +440,8 @@ st_close(dev_t dev, int flags __unused, int devtype __unused,
 {
 	const int unit = minor(dev);
 
-	if (unit < 0 || unit >= ST_MAXOPEN)
-		return ENXIO;
+	if (unit < 0 || unit >= ST_MAXOPEN || !st_opens[unit].used)
+		return 0;
 	st_drop_mapping(&st_opens[unit]);
 	os_mtx_lock(&st_dev_lock);
 	st_opens[unit].used = false;
