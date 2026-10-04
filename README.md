@@ -11,11 +11,14 @@ it gives QEMU, and anything built on QEMU, hardware-speed virtual machines.
 
 ## Status
 
-**Guests run on real hardware, but only test guests.** On 2026-10-04 the kext
-loaded on a Ryzen 7 2700 running macOS 10.15.5 and passed `nvmm-guest-test`
-(5,598 checks): small real-mode programs, not an operating system. No OS has
-been booted in it yet, through QEMU or otherwise. Read this table before
-trusting any of it.
+**It runs Linux and Docker on one machine, with one virtual CPU.** On
+2026-10-04, on a Ryzen 7 2700 running macOS 10.15.5, the kext passed
+`nvmm-guest-test` (5,598 checks), and QEMU 7.2 with `-accel nvmm` booted
+Alpine Linux 3.24, installed Docker in it, and ran containers
+(`test/darwin/docker-test.exp`). That is one run, on one machine and one
+macOS version, with a single vCPU and 2 GB of guest RAM. It also panicked
+that machine once the same evening (since fixed; see below). Read this table
+before trusting any of it.
 
 | Piece | State |
 |---|---|
@@ -26,7 +29,7 @@ trusting any of it.
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
 | Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
-| QEMU with `-accel nvmm` on macOS | Builds (`tools/build-qemu.sh`) and starts a machine through the driver on real Sequoia, with the stand-in engine. **Has never run guest code**: QEMU has not yet been run against the real engine |
+| QEMU with `-accel nvmm` on macOS | QEMU 7.2.22 on macOS 10.15.5 boots Linux and runs Docker through the driver, one vCPU. QEMU 11 builds and starts a machine on macOS 15 against the stand-in engine, but has not run a guest. More than one vCPU per machine has never been tried |
 
 **macOS versions.** One binary is meant to serve macOS 10.13 (the first with
 AMD Ryzen support in the Hackintosh world) through 15. What that rests on:
@@ -227,9 +230,13 @@ flushing after an unmap, and next-RIP save.
 
 ## Known gaps
 
-- No operating system has been booted as a guest. Long mode, paging inside
-  the guest, interrupt injection and virtual devices are all unexercised on
-  real hardware.
+- More than one vCPU in a machine is untested, as are guests larger than
+  2 GB, long uptimes, and sleep and wake with a guest running.
+- A guest too large for the host to wire used to panic the host: the imported
+  code assumed that allocation could not fail. It now returns ENOMEM, and
+  the emulator tests cover it. Why a 4 GB guest could not be allocated on a
+  16 GB host after several earlier runs is not explained; guest memory was
+  seen to be released after a clean run.
 - Whether guest memory really ends up in 2M pages on the Ryzen is not known:
   the guest test passes either way and does not report it.
 - Sleep and wake: the notifications arrive and the glue survives a cycle on
