@@ -392,6 +392,29 @@ test_memory(void)
 	/* Every change to the guest's address space kicked the other CPUs. */
 	CHECK(bare_stats.ipis >= ipis + 4);
 
+	/*
+	 * More host memory than there is: refused, and nothing is left
+	 * behind. (Seen on real hardware as a panic, when a 4G guest was
+	 * started on a host that could not wire 4G.)
+	 */
+	{
+		struct nvmm_ioc_hva_map hm = {
+			.machid = machid, .hva = HVA_BASE + (1ULL << 32),
+			.size = 1ULL << 34,
+		};
+		struct nvmm_ioc_hva_unmap hu = {
+			.machid = machid, .hva = hm.hva, .size = hm.size,
+		};
+
+		CHECK_EQ(ioc(NVMM_IOC_HVA_MAP, &hm), ENOMEM);
+		CHECK(ioc(NVMM_IOC_HVA_UNMAP, &hu) != 0);
+		/* The slot it would have used is free again. */
+		hm.size = 0x1000;
+		hu.size = 0x1000;
+		CHECK_EQ(ioc(NVMM_IOC_HVA_MAP, &hm), 0);
+		CHECK_EQ(ioc(NVMM_IOC_HVA_UNMAP, &hu), 0);
+	}
+
 	/* Partial unmap in the middle of guest RAM, then put it back. */
 	gpa_unmap(0x40000, 0x2000);
 	gpa_map(0x40000, 0x40000, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);

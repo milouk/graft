@@ -227,10 +227,26 @@ nvmm_machine_create(struct nvmm_owner *owner,
 	mach->gpa_begin = 0;
 	mach->gpa_end = NVMM_MAX_RAM;
 	mach->vm = os_vmspace_create(mach->gpa_begin, mach->gpa_end);
+#if defined(NVMM_PORT)
+	/* Unlike on BSD, these allocations can fail. */
+	if (mach->vm == NULL) {
+		nvmm_machine_free(mach);
+		nvmm_machine_put(mach);
+		return ENOMEM;
+	}
+#endif
 
 	/* Create the comm vmobj. */
 	mach->commvmobj = os_vmobj_create(
 	    NVMM_MAX_VCPUS * NVMM_COMM_PAGE_SIZE);
+#if defined(NVMM_PORT)
+	if (mach->commvmobj == NULL) {
+		os_vmspace_destroy(mach->vm);
+		nvmm_machine_free(mach);
+		nvmm_machine_put(mach);
+		return ENOMEM;
+	}
+#endif
 
 	(*nvmm_impl->machine_create)(mach);
 
@@ -729,6 +745,17 @@ nvmm_hva_map(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
 	hmapping->hva = args->hva;
 	hmapping->size = args->size;
 	hmapping->vmobj = os_vmobj_create(hmapping->size);
+#if defined(NVMM_PORT)
+	/*
+	 * Guest RAM is wired memory here, so asking for more than the host
+	 * can give is an ordinary failure, not something that cannot happen.
+	 */
+	if (hmapping->vmobj == NULL) {
+		hmapping->present = false;
+		error = ENOMEM;
+		goto out;
+	}
+#endif
 	uva = hmapping->hva;
 
 	/* Map the vmobj into the user address space, as pageable. */

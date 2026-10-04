@@ -1,0 +1,86 @@
+#!/usr/bin/expect -f
+#
+# docker-test.exp — boot Alpine Linux under QEMU's nvmm accelerator, install
+# Docker inside it, and run `docker ps -a` and a container.
+#
+#   sudo ./docker-test.exp <qemu-system-x86_64> <alpine-virt.iso> <disk.qcow2>
+#
+# SMP=n in the environment sets the number of virtual CPUs (default 1);
+# QEMU_EXTRA adds QEMU arguments.
+# The Alpine release in the repository URLs below must match the ISO.
+
+if {$argc != 3} {
+    puts "usage: docker-test.exp <qemu-system-x86_64> <alpine-virt.iso> <disk.qcow2>"
+    exit 2
+}
+lassign $argv qemu iso disk
+
+set smp 1
+if {[info exists env(SMP)]} { set smp $env(SMP) }
+
+# QEMU_EXTRA in the environment adds arguments, for debugging.
+set extra {}
+if {[info exists env(QEMU_EXTRA)]} { set extra [split $env(QEMU_EXTRA)] }
+
+set timeout 180
+spawn $qemu -accel nvmm -M q35 -m 4G -smp $smp -nographic \
+    -cdrom $iso -drive file=$disk,if=virtio \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 {*}$extra
+
+# LLDB_OUT=<file> attaches lldb to QEMU, with a breakpoint on exit(), and
+# writes every thread's backtrace there when it is hit.
+if {[info exists env(LLDB_OUT)]} {
+    set qpid [exp_pid]
+    exec sh -c "lldb -p $qpid -b \
+        -o 'process handle SIGUSR1 SIGUSR2 SIGALRM SIGPIPE SIGIO SIGCHLD -n false -p true -s false' \
+        -o 'breakpoint set -n exit' -o 'continue' \
+        -o 'thread backtrace all' -o 'register read' -o 'detach' \
+        > $env(LLDB_OUT) 2>&1" &
+    sleep 3
+}
+
+# How QEMU ended: its exit code, or the signal that killed it.
+proc qemu_status {} {
+    set w [wait]
+    if {[llength $w] > 4} {
+        return "killed: [lrange $w 4 end]"
+    }
+    return "exit code [lindex $w 3]"
+}
+
+proc run {cmd {t 180}} {
+    set timeout $t
+    send -- "$cmd\r"
+    expect {
+        -re {localhost:~# $} {}
+        timeout { puts "\n### TIMEOUT waiting after: $cmd"; exit 1 }
+        eof { puts "\n### QEMU EXITED during: $cmd ([qemu_status])"; exit 1 }
+    }
+}
+
+expect {
+    "login: " {}
+    timeout { puts "\n### TIMEOUT waiting for the login prompt"; exit 1 }
+    eof { puts "\n### QEMU EXITED before login"; exit 1 }
+}
+send "root\r"
+expect -re {localhost:~# $}
+
+run {uname -a; nproc; free -m | head -2; date}
+run {ip link set eth0 up && udhcpc -i eth0 -q -n} 60
+run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/main > /etc/apk/repositories}
+run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/community >> /etc/apk/repositories}
+run {apk update} 120
+run {apk add e2fsprogs docker} 900
+run {mkfs.ext4 -q -F /dev/vda && mkdir -p /var/lib/docker && mount /dev/vda /var/lib/docker && df -h /var/lib/docker | tail -1} 120
+run {rc-service cgroups start; rc-service docker start} 120
+run {for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker version | grep -E "^(Client|Server)| Version"} 120
+run {docker ps -a} 60
+run {docker run --rm hello-world} 900
+run {docker run --rm alpine sh -c "echo hello from a container on \$(uname -m), kernel \$(uname -r)"} 900
+run {docker ps -a} 60
+run {echo NVMM-DOCKER-TEST-DONE}
+send "poweroff\r"
+set timeout 90
+expect eof
+puts "\n### QEMU ended after poweroff ([qemu_status])"
