@@ -231,13 +231,15 @@ involving nvmm-run), so that path is untested.
 On the Ryzen 7 2700 under macOS 10.15.5, with a Docker 24 client on the Mac:
 `nvmm-docker start` takes about six seconds; `docker ps`, `docker run` with
 output and with piped input, pulls from Docker Hub, and a container with a
-published port all work. What is not there yet:
+published port, reachable from the Mac, all work. Disk speed measured in the
+guest: about 900 MB/s direct reads, 550 MB/s direct writes, 270 MB/s
+buffered writes with a final sync. (One early run measured 10 MB/s; that
+did not reproduce.) What is not there yet:
 
-- Published ports are reachable inside the VM, not from the Mac.
+- Published ports are passed on for TCP only, and through a forwarder that
+  closes a connection when either side half-closes.
 - No file sharing: `-v /a/mac/path:...` has nothing to mount.
 - One vCPU. More needs a local APIC and I/O APIC.
-- Disk writes are slow, about 10 MB/s: every request costs a trip through
-  the instruction emulator.
 - The guest cannot power itself off; it halts, and nvmm-run notices.
 - It has run for minutes, not days.
 
