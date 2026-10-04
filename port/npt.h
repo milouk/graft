@@ -23,6 +23,8 @@
 #define NPT_PROT_WRITE	0x2
 #define NPT_PROT_EXEC	0x4
 
+#define NPT_LARGE_SIZE	(2ULL * 1024 * 1024)
+
 struct npt_ops {
 	/* One zeroed page; both its virtual and physical address. */
 	int (*page_alloc)(void *ctx, void **va, uint64_t *pa);
@@ -41,7 +43,7 @@ struct npt_table {
 struct npt {
 	struct npt_ops ops;
 	struct npt_table *root;
-	uint64_t npages;		/* 4K pages currently mapped */
+	uint64_t npages;		/* 4K pages currently mapped (a 2M page is 512) */
 	uint64_t ntables;		/* table pages currently allocated */
 };
 
@@ -54,7 +56,18 @@ uint64_t npt_root_pa(const struct npt *npt);
 /* Map one 4K page. Replaces an existing mapping at that address. */
 int	npt_map(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot);
 
-/* Unmap [gpa, gpa+size). Empty tables are freed. Returns pages removed. */
+/*
+ * Map one 2M page; both addresses must be 2M aligned. Replaces whatever was
+ * mapped in that range. It counts as 512 pages in 'npages'. Mapping or
+ * unmapping part of it later splits it back into 4K pages.
+ */
+int	npt_map_large(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot);
+
+/*
+ * Unmap [gpa, gpa+size). Empty tables are freed. Returns 4K pages removed.
+ * If a 2M page has to be split and no memory is available, all of it is
+ * removed, so the result can exceed size / 4K.
+ */
 uint64_t npt_unmap(struct npt *npt, uint64_t gpa, uint64_t size);
 
 /* Look a guest address up. Returns false if it is not mapped. */

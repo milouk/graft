@@ -455,6 +455,7 @@ struct port_membuf {
 	size_t npages;
 };
 
+#define BARE_LARGE		(2UL << 20)
 #define BARE_MAX_ALIASES	16
 static struct {
 	uintptr_t hva;
@@ -474,7 +475,20 @@ port_membuf_create(size_t size)
 		return NULL;
 	buf->size = size;
 	buf->npages = (size + 4095) / 4096;
-	if (port_pages_alloc(buf->npages, &buf->va, &pa) != 0) {
+	if (size >= BARE_LARGE) {
+		/*
+		 * Big buffers start on a 2M boundary, as a platform that
+		 * wants 2M guest pages would arrange. Never reused.
+		 */
+		buf->va = bump(buf->npages * 4096, BARE_LARGE);
+		if (buf->va == NULL) {
+			port_free(buf, sizeof(*buf));
+			return NULL;
+		}
+		memset(buf->va, 0, buf->npages * 4096);
+		bare_stats.pages_live += buf->npages;
+		(void)pa;
+	} else if (port_pages_alloc(buf->npages, &buf->va, &pa) != 0) {
 		port_free(buf, sizeof(*buf));
 		return NULL;
 	}

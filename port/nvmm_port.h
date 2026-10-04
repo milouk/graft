@@ -293,6 +293,7 @@ int		os_vmobj_map_kern(os_vmmap_t *, vaddr_t *, vsize_t,
 void		os_vmobj_unmap(os_vmmap_t *, vaddr_t, vaddr_t, bool);
 
 /* Translate a guest-physical address by walking the space's nested page table. */
+extern unsigned long port_vm_nlarge;
 bool		port_vm_guest_lookup(os_vmspace_t *, vaddr_t, paddr_t *);
 
 /* Drop every user mapping a process created, when it closes the device. */

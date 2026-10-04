@@ -309,13 +309,38 @@ port_guest_unmap_locked(os_vmspace_t *vs, vaddr_t start, vaddr_t end)
 	return 0;
 }
 
+/* 2M pages entered since load. Diagnostic only. */
+unsigned long port_vm_nlarge;
+
+/*
+ * Can the 2M of guest memory at 'gpa' be one 2M page? Only if the guest
+ * address and the host address are both 2M aligned and the host pages behind
+ * it are one contiguous run. Whether they are is up to the platform's buffer
+ * allocator; this just takes the chance when it is there.
+ */
+static bool
+port_guest_large_ok(os_vmobj_t *obj, vaddr_t gpa, voff_t off, vsize_t left,
+    uint64_t hpa)
+{
+	vsize_t i;
+
+	if (left < NPT_LARGE_SIZE || (gpa & (NPT_LARGE_SIZE - 1)) != 0 ||
+	    (hpa & (NPT_LARGE_SIZE - 1)) != 0)
+		return false;
+	for (i = NVMM_PAGE_SIZE; i < NPT_LARGE_SIZE; i += NVMM_PAGE_SIZE) {
+		if (port_membuf_pa(obj->buf, (size_t)(off + i)) != hpa + i)
+			return false;
+	}
+	return true;
+}
+
 static int
 port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
     voff_t off, int prot)
 {
 	struct port_mapping *m;
 	const int nprot = port_prot_to_npt(prot);
-	vsize_t done;
+	vsize_t done, step;
 	int error;
 
 	if ((gpa & NVMM_PAGE_MASK) != 0 || (size & NVMM_PAGE_MASK) != 0 ||
@@ -342,10 +367,21 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 		return error;
 	}
 
-	for (done = 0; done < size; done += NVMM_PAGE_SIZE) {
-		if (npt_map(&vs->npt, gpa + done,
-		    port_membuf_pa(obj->buf, (size_t)(off + done)),
-		    nprot) != 0) {
+	for (done = 0; done < size; done += step) {
+		const uint64_t hpa = port_membuf_pa(obj->buf,
+		    (size_t)(off + done));
+
+		if (port_guest_large_ok(obj, gpa + done, off + done,
+		    size - done, hpa)) {
+			step = NPT_LARGE_SIZE;
+			error = npt_map_large(&vs->npt, gpa + done, hpa, nprot);
+			if (error == 0)
+				(void)__sync_fetch_and_add(&port_vm_nlarge, 1);
+		} else {
+			step = NVMM_PAGE_SIZE;
+			error = npt_map(&vs->npt, gpa + done, hpa, nprot);
+		}
+		if (error != 0) {
 			(void)npt_unmap(&vs->npt, gpa, done);
 			(void)__sync_fetch_and_add(&vs->gen, 1);
 			port_mtx_unlock(&vs->lock);

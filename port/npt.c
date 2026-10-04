@@ -16,8 +16,11 @@
  * user bit must be set at every level or the guest faults on its first fetch.
  */
 #define PTE_U		(1ULL << 2)
+/* In a page-directory entry: this maps a 2M page instead of a table. */
+#define PTE_PS		(1ULL << 7)
 #define PTE_NX		(1ULL << 63)
 #define PTE_FRAME	0x000FFFFFFFFFF000ULL
+#define PTE_PROT	(PTE_W | PTE_NX)
 
 /* Guest-physical addresses are limited to 48 bits by the 4-level format. */
 #define NPT_GPA_MAX	(1ULL << 48)
@@ -121,27 +124,66 @@ npt_root_pa(const struct npt *npt)
 	return npt->root->pa;
 }
 
-int
-npt_map(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot)
+static uint64_t
+npt_leaf_bits(int prot)
+{
+	uint64_t pte = PTE_P | PTE_U;
+
+	if (prot & NPT_PROT_WRITE)
+		pte |= PTE_W;
+	if ((prot & NPT_PROT_EXEC) == 0)
+		pte |= PTE_NX;
+	return pte;
+}
+
+/*
+ * Replace the 2M page at 'pd->entries[idx]' with a table of 512 4K pages
+ * that map the same memory with the same rights. The page count does not
+ * change. Fails only if a table cannot be allocated.
+ */
+static int
+npt_split(struct npt *npt, struct npt_table *pd, unsigned int idx)
+{
+	const uint64_t large = pd->entries[idx];
+	const uint64_t base = large & PTE_FRAME & ~(NPT_LARGE_SIZE - 1);
+	const uint64_t bits = (large & PTE_PROT) | PTE_P | PTE_U;
+	struct npt_table *pt;
+	unsigned int i;
+
+	pt = npt_table_alloc(npt);
+	if (pt == NULL)
+		return -1;
+	for (i = 0; i < NPT_ENTRIES; i++)
+		pt->entries[i] = (base + (uint64_t)i * NPT_PAGE_SIZE) | bits;
+	pt->used = NPT_ENTRIES;
+
+	pd->children[idx] = pt;
+	pd->entries[idx] = pt->pa | PTE_P | PTE_W | PTE_U;
+	return 0;
+}
+
+/*
+ * Walk down to the table at 'target' level (0 = page table, 1 = page
+ * directory) that covers 'gpa', creating tables on the way.
+ */
+static struct npt_table *
+npt_walk_create(struct npt *npt, uint64_t gpa, int target)
 {
 	struct npt_table *t = npt->root, *child;
 	unsigned int idx;
-	uint64_t pte;
 	int level;
 
-	if (gpa >= NPT_GPA_MAX || (gpa & (NPT_PAGE_SIZE - 1)) != 0 ||
-	    (hpa & ~PTE_FRAME) != 0)
-		return -1;
-	if ((prot & NPT_PROT_READ) == 0)
-		return -1;
-
-	for (level = NPT_LEVELS - 1; level > 0; level--) {
+	for (level = NPT_LEVELS - 1; level > target; level--) {
 		idx = npt_index(gpa, level);
+		if (level == 1 && (t->entries[idx] & PTE_PS) != 0) {
+			if (npt_split(npt, t, idx) != 0)
+				return NULL;
+		}
 		child = t->children[idx];
 		if (child == NULL) {
 			child = npt_table_alloc(npt);
 			if (child == NULL)
-				return -1;
+				return NULL;
 			t->children[idx] = child;
 			/*
 			 * Intermediate entries are fully permissive; the leaf
@@ -152,19 +194,68 @@ npt_map(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot)
 		}
 		t = child;
 	}
+	return t;
+}
+
+int
+npt_map(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot)
+{
+	struct npt_table *t;
+	unsigned int idx;
+	uint64_t pte;
+
+	if (gpa >= NPT_GPA_MAX || (gpa & (NPT_PAGE_SIZE - 1)) != 0 ||
+	    (hpa & ~PTE_FRAME) != 0)
+		return -1;
+	if ((prot & NPT_PROT_READ) == 0)
+		return -1;
+
+	t = npt_walk_create(npt, gpa, 0);
+	if (t == NULL)
+		return -1;
 
 	idx = npt_index(gpa, 0);
-	pte = hpa | PTE_P | PTE_U;
-	if (prot & NPT_PROT_WRITE)
-		pte |= PTE_W;
-	if ((prot & NPT_PROT_EXEC) == 0)
-		pte |= PTE_NX;
+	pte = hpa | npt_leaf_bits(prot);
 
 	if ((t->entries[idx] & PTE_P) == 0) {
 		t->used++;
 		npt->npages++;
 	}
 	t->entries[idx] = pte;
+	return 0;
+}
+
+int
+npt_map_large(struct npt *npt, uint64_t gpa, uint64_t hpa, int prot)
+{
+	struct npt_table *pd, *old;
+	unsigned int idx;
+
+	if (gpa >= NPT_GPA_MAX || (gpa & (NPT_LARGE_SIZE - 1)) != 0 ||
+	    (hpa & ~PTE_FRAME) != 0 || (hpa & (NPT_LARGE_SIZE - 1)) != 0)
+		return -1;
+	if ((prot & NPT_PROT_READ) == 0)
+		return -1;
+
+	pd = npt_walk_create(npt, gpa, 1);
+	if (pd == NULL)
+		return -1;
+
+	idx = npt_index(gpa, 1);
+	old = pd->children[idx];
+	if (old != NULL) {
+		/* 4K pages were mapped here; the 2M page replaces them all. */
+		npt->npages -= old->used;
+		npt_table_free(npt, old);
+		pd->children[idx] = NULL;
+	} else if ((pd->entries[idx] & PTE_P) != 0) {
+		npt->npages -= NPT_ENTRIES;
+	} else {
+		pd->used++;
+	}
+
+	pd->entries[idx] = hpa | npt_leaf_bits(prot) | PTE_PS;
+	npt->npages += NPT_ENTRIES;
 	return 0;
 }
 
@@ -194,6 +285,26 @@ npt_unmap_level(struct npt *npt, struct npt_table *t, int level,
 			npt->npages--;
 			(*removed)++;
 			continue;
+		}
+
+		if (level == 1 && (t->entries[i] & PTE_PS) != 0) {
+			/*
+			 * A 2M page. If only part of it goes, split it and
+			 * carry on into the new table. If there is no memory
+			 * to split it with, the whole page goes: the guest
+			 * then faults on the rest and stops, which is better
+			 * than leaving it memory it was told to give up.
+			 */
+			if ((lo < start || hi > end) &&
+			    npt_split(npt, t, i) == 0) {
+				/* fall through to the recursion below */
+			} else {
+				t->entries[i] = 0;
+				t->used--;
+				npt->npages -= NPT_ENTRIES;
+				(*removed) += NPT_ENTRIES;
+				continue;
+			}
 		}
 
 		if (npt_unmap_level(npt, t->children[i], level - 1, lo,
@@ -237,19 +348,28 @@ npt_lookup(const struct npt *npt, uint64_t gpa, uint64_t *hpa, int *prot)
 	if (gpa >= NPT_GPA_MAX)
 		return false;
 
+	uint64_t offmask = NPT_PAGE_SIZE - 1;
+
 	for (level = NPT_LEVELS - 1; level > 0; level--) {
 		idx = npt_index(gpa, level);
+		if (level == 1 && (t->entries[idx] & PTE_PS) != 0)
+			break;
 		if (t->children[idx] == NULL)
 			return false;
 		t = t->children[idx];
 	}
 
-	pte = t->entries[npt_index(gpa, 0)];
+	if (level == 1) {
+		pte = t->entries[idx];
+		offmask = NPT_LARGE_SIZE - 1;
+	} else {
+		pte = t->entries[npt_index(gpa, 0)];
+	}
 	if ((pte & PTE_P) == 0)
 		return false;
 
 	if (hpa != NULL)
-		*hpa = (pte & PTE_FRAME) | (gpa & (NPT_PAGE_SIZE - 1));
+		*hpa = (pte & PTE_FRAME & ~offmask) | (gpa & offmask);
 	if (prot != NULL) {
 		*prot = NPT_PROT_READ;
 		if (pte & PTE_W)

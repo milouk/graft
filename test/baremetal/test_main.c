@@ -47,6 +47,9 @@ static int nchecks;
 #define HVA_SIZE	0x100000ULL	/* 1 MiB of backing memory */
 #define RAM_SIZE	0x80000ULL	/* of which 512 KiB is guest RAM at 0 */
 #define MMIO_GPA	0x90000ULL	/* left unmapped on purpose */
+#define LARGE		0x200000ULL
+#define BIG_HVA		0x0000700040000000ULL
+#define BIG_SIZE	(2 * LARGE)
 
 static struct nvmm_owner owner = { .pid = 1 };
 static nvmm_machid_t machid;
@@ -394,6 +397,98 @@ test_memory(void)
 	gpa_map(0x40000, 0x40000, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
 }
 
+/*
+ * Guest memory that is 2M aligned on both sides is entered as one 2M page.
+ * The guest runs from it; taking 4K out of the middle splits it without
+ * disturbing the rest; and the address space is then put back as it was.
+ */
+static void
+test_large_pages(void)
+{
+	static const uint8_t code[] = {
+		0xB8, 0x00, 0x90,		/* mov  $0x9000,%ax  */
+		0x8E, 0xD8,			/* mov  %ax,%ds      */
+		0xC6, 0x06, 0x00, 0x00, 0x66,	/* movb $0x66,0x0000 */
+		0xB8, 0xFF, 0xFF,		/* mov  $0xffff,%ax  */
+		0x8E, 0xD8,			/* mov  %ax,%ds      */
+		0xC6, 0x06, 0x10, 0x80, 0x77,	/* movb $0x77,0x8010 */
+		0xF4,				/* hlt               */
+	};
+	struct nvmm_ioc_hva_map hm;
+	struct nvmm_ioc_hva_unmap hu;
+	struct nvmm_vcpu_exit *exit;
+	const unsigned long nlarge = port_vm_nlarge;
+	uint8_t *big;
+
+	memset(&hm, 0, sizeof(hm));
+	hm.machid = machid;
+	hm.hva = BIG_HVA;
+	hm.size = BIG_SIZE;
+	CHECK_EQ(ioc(NVMM_IOC_HVA_MAP, &hm), 0);
+	big = bare_hva_ptr(BIG_HVA);
+	CHECK(big != NULL);
+	CHECK_EQ((uintptr_t)big & (LARGE - 1), 0);
+
+	/* 4M at 0, over the RAM that was there: two 2M pages. */
+	{
+		struct nvmm_ioc_gpa_map args = {
+			.machid = machid, .hva = BIG_HVA, .gpa = 0,
+			.size = BIG_SIZE,
+			.prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+		};
+		CHECK_EQ(ioc(NVMM_IOC_GPA_MAP, &args), 0);
+	}
+	CHECK_EQ(port_vm_nlarge, nlarge + 2);
+
+	/* Misaligned by one page, nothing can be a 2M page. */
+	{
+		struct nvmm_ioc_gpa_map args = {
+			.machid = machid, .hva = BIG_HVA + 0x1000,
+			.gpa = 0x40000000, .size = LARGE,
+			.prot = PROT_READ,
+		};
+		CHECK_EQ(ioc(NVMM_IOC_GPA_MAP, &args), 0);
+		gpa_unmap(0x40000000, LARGE);
+	}
+	CHECK_EQ(port_vm_nlarge, nlarge + 2);
+
+	/* Run from the 2M page, and write below and above 1M through it. */
+	memcpy(big + 0x3000, code, sizeof(code));
+	set_rip(0x3000);
+	exit = run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(big[MMIO_GPA], 0x66);
+	CHECK_EQ(big[0xFFFF0 + 0x8010], 0x77);
+
+	/* Take one 4K page out of the middle: only that page faults. */
+	big[MMIO_GPA] = 0;
+	big[0xFFFF0 + 0x8010] = 0;
+	gpa_unmap(MMIO_GPA, 0x1000);
+	set_rip(0x3000);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
+	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x3005);
+	CHECK_EQ(big[MMIO_GPA], 0x00);
+	/* Skip the faulting write; the rest of the split page still works. */
+	set_rip(0x300A);
+	exit = run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(big[0xFFFF0 + 0x8010], 0x77);
+
+	/* Put the original RAM back and drop the big buffer. */
+	gpa_unmap(0, BIG_SIZE);
+	gpa_map(0, 0, RAM_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+	memset(&hu, 0, sizeof(hu));
+	hu.machid = machid;
+	hu.hva = BIG_HVA;
+	hu.size = BIG_SIZE;
+	CHECK_EQ(ioc(NVMM_IOC_HVA_UNMAP, &hu), 0);
+
+	/* The old layout is back: the hole is a hole again. */
+	load(0x3000, code, sizeof(code));
+	set_rip(0x3000);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
+	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
+}
+
 /* CPUID is answered by the engine without involving the emulator. */
 static void
 test_cpuid(void)
@@ -638,6 +733,7 @@ kmain(void)
 		RUN(test_setup);
 		RUN(test_io_and_hlt);
 		RUN(test_memory);
+		RUN(test_large_pages);
 		RUN(test_cpuid);
 		RUN(test_fpu);
 		RUN(test_exit_budget);

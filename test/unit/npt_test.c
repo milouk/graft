@@ -103,6 +103,21 @@ hw_walk(uint64_t root_pa, uint64_t gpa, uint64_t *leaf)
 			*leaf = e;
 			return 1;
 		}
+		if (level == 1 && (e & 0x80) != 0) {
+			/* A 2M page: its frame must be 2M aligned. */
+			if ((e & 0x000FFFFFFFE00000ULL) !=
+			    (e & 0x000FFFFFFFFFF000ULL)) {
+				fprintf(stderr, "FAIL: unaligned 2M frame\n");
+				exit(1);
+			}
+			*leaf = e;
+			return 2;
+		}
+		if ((e & 0x80) != 0) {
+			fprintf(stderr, "FAIL: page-size bit at level %d\n",
+			    level);
+			exit(1);
+		}
 		if ((e & 2) == 0) {
 			fprintf(stderr, "FAIL: intermediate entry not "
 			    "writable at level %d\n", level);
@@ -223,6 +238,122 @@ main(void)
 	CHECK(hw_walk(npt_root_pa(&npt), 0x8000000000ULL, &leaf) == 1);
 	CHECK(npt_unmap(&npt, 0, 1ULL << 48) == 1);
 	CHECK(npt.ntables == 1);
+
+	/* --- 2M pages ----------------------------------------------------- */
+	{
+		const uint64_t L = NPT_LARGE_SIZE;
+		const uint64_t g = 0x40000000ULL;	/* 1G, a fresh subtree */
+		const uint64_t h = 0x80000000ULL;
+
+		/* Alignment is required on both sides. */
+		CHECK(npt_map_large(&npt, g + PAGE, h, NPT_PROT_READ) != 0);
+		CHECK(npt_map_large(&npt, g, h + PAGE, NPT_PROT_READ) != 0);
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_WRITE) != 0);
+		CHECK(npt.npages == 0 && npt.ntables == 1);
+
+		/* One 2M page: three tables (root, PDPT, PD), 512 pages. */
+		CHECK(npt_map_large(&npt, g, h,
+		    NPT_PROT_READ | NPT_PROT_WRITE) == 0);
+		CHECK(npt.ntables == 3 && npt.npages == 512);
+		CHECK(hw_walk(npt_root_pa(&npt), g, &leaf) == 2);
+		CHECK((leaf & 0x000FFFFFFFFFF000ULL) == h);
+		CHECK((leaf & 2) != 0 && (leaf >> 63) == 1);
+		CHECK(hw_walk(npt_root_pa(&npt), g + L - PAGE, &leaf) == 2);
+		CHECK(hw_walk(npt_root_pa(&npt), g + L, &leaf) == 0);
+		CHECK(npt_lookup(&npt, g + 0x123456, &hpa, &prot));
+		CHECK(hpa == h + 0x123456);
+		CHECK(prot == (NPT_PROT_READ | NPT_PROT_WRITE));
+
+		/* Mapping it again replaces it without counting twice. */
+		CHECK(npt_map_large(&npt, g, h + L, NPT_PROT_READ) == 0);
+		CHECK(npt.ntables == 3 && npt.npages == 512);
+		CHECK(npt_lookup(&npt, g + 0x1000, &hpa, &prot));
+		CHECK(hpa == h + L + 0x1000 && prot == NPT_PROT_READ);
+
+		/* A 4K mapping inside it splits it; the rest is unchanged. */
+		CHECK(npt_map(&npt, g + 5 * PAGE, 0x7000,
+		    NPT_PROT_READ | NPT_PROT_EXEC) == 0);
+		CHECK(npt.ntables == 4 && npt.npages == 512);
+		for (i = 0; i < 512; i++) {
+			CHECK(hw_walk(npt_root_pa(&npt), g + i * PAGE,
+			    &leaf) == 1);
+			if (i == 5) {
+				CHECK((leaf & 0x000FFFFFFFFFF000ULL) == 0x7000);
+				CHECK((leaf >> 63) == 0);
+			} else {
+				CHECK((leaf & 0x000FFFFFFFFFF000ULL) ==
+				    h + L + i * PAGE);
+				CHECK((leaf & 2) == 0 && (leaf >> 63) == 1);
+			}
+		}
+
+		/* A 2M page over 4K pages frees their table. */
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_READ) == 0);
+		CHECK(npt.ntables == 3 && npt.npages == 512);
+		CHECK(hw_walk(npt_root_pa(&npt), g + 5 * PAGE, &leaf) == 2);
+
+		/* ... also when only some of the 4K pages were present. */
+		CHECK(npt_map(&npt, g + L, 0x9000, NPT_PROT_READ) == 0);
+		CHECK(npt.npages == 513 && npt.ntables == 4);
+		CHECK(npt_map_large(&npt, g + L, h + L, NPT_PROT_READ) == 0);
+		CHECK(npt.npages == 1024 && npt.ntables == 3);
+
+		/* Unmapping part of a 2M page splits it. */
+		CHECK(npt_unmap(&npt, g + 16 * PAGE, 16 * PAGE) == 16);
+		CHECK(npt.npages == 1008 && npt.ntables == 4);
+		for (i = 0; i < 512; i++) {
+			int want = (i < 16 || i >= 32) ? 1 : 0;
+			CHECK(hw_walk(npt_root_pa(&npt), g + i * PAGE,
+			    &leaf) == want);
+			CHECK(npt_lookup(&npt, g + i * PAGE, &hpa, NULL) ==
+			    (want == 1));
+			if (want)
+				CHECK(hpa == h + i * PAGE);
+		}
+		/* The neighbouring 2M page was not touched. */
+		CHECK(hw_walk(npt_root_pa(&npt), g + L, &leaf) == 2);
+
+		/* A range that starts and ends inside 2M pages. */
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_READ) == 0);
+		CHECK(npt_map_large(&npt, g + 2 * L, h + 2 * L,
+		    NPT_PROT_READ) == 0);
+		CHECK(npt.npages == 1536 && npt.ntables == 3);
+		CHECK(npt_unmap(&npt, g + L - PAGE, L + 2 * PAGE) == 514);
+		CHECK(npt.npages == 1022 && npt.ntables == 5);
+		CHECK(hw_walk(npt_root_pa(&npt), g + L - 2 * PAGE, &leaf) == 1);
+		CHECK(hw_walk(npt_root_pa(&npt), g + L - PAGE, &leaf) == 0);
+		CHECK(hw_walk(npt_root_pa(&npt), g + L, &leaf) == 0);
+		CHECK(hw_walk(npt_root_pa(&npt), g + 2 * L, &leaf) == 0);
+		CHECK(hw_walk(npt_root_pa(&npt), g + 2 * L + PAGE, &leaf) == 1);
+
+		/* Whole 2M pages go without being split. */
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_READ) == 0);
+		CHECK(npt_unmap(&npt, g, L) == 512);
+		CHECK(npt.ntables == 4);	/* root, PDPT, PD, last PT */
+
+		/*
+		 * No memory to split with: the whole 2M page is removed
+		 * rather than leaving memory the caller asked to take away.
+		 */
+		CHECK(npt_unmap(&npt, 0, 1ULL << 48) == 511);
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_READ) == 0);
+		fail_after = 0;
+		CHECK(npt_unmap(&npt, g + PAGE, PAGE) == 512);
+		CHECK(npt_map(&npt, g + PAGE, 0x1000, NPT_PROT_READ) != 0);
+		fail_after = -1;
+		CHECK(npt.npages == 0 && npt.ntables == 1);
+
+		/* And a 4K map into a 2M page that cannot be split fails clean. */
+		CHECK(npt_map_large(&npt, g, h, NPT_PROT_READ) == 0);
+		fail_after = 0;
+		CHECK(npt_map(&npt, g + PAGE, 0x1000, NPT_PROT_READ) != 0);
+		fail_after = -1;
+		CHECK(hw_walk(npt_root_pa(&npt), g + PAGE, &leaf) == 2);
+		CHECK(npt.npages == 512);
+		CHECK(npt_unmap(&npt, 0, 1ULL << 48) == 512);
+		CHECK(npt.npages == 0 && npt.ntables == 1);
+		CHECK(npages_live == 3);
+	}
 
 	/* --- destroy frees every page ------------------------------------- */
 	for (i = 0; i < 2000; i++)
