@@ -1688,6 +1688,44 @@ svm_exit_evt(struct svm_cpudata *cpudata, struct vmcb *vmcb)
 	cpudata->evt_pending = true;
 }
 
+#if defined(NVMM_TEST_NO_NRIPS)
+/*
+ * Test builds only. QEMU's software implementation of AMD-V does not provide
+ * next-RIP save, which every real CPU this engine supports does, and which the
+ * engine relies on to step past an intercepted instruction. So that the rest
+ * of the engine can still be exercised under emulation, fill the field in for
+ * the instructions whose length is fixed. Prefixed encodings would be wrong
+ * here; the tests do not use any.
+ */
+static void
+svm_test_fake_nrip(struct vmcb *vmcb)
+{
+	uint64_t len;
+
+	/*
+	 * The emulator never writes this field, so whatever is in it was put
+	 * there by this function on an earlier exit. Recompute it every time.
+	 */
+	vmcb->ctrl.nrip = 0;
+
+	switch (vmcb->ctrl.exitcode) {
+	case VMCB_EXITCODE_HLT:
+		len = 1;
+		break;
+	case VMCB_EXITCODE_CPUID:
+	case VMCB_EXITCODE_MSR:
+		len = 2;
+		break;
+	case VMCB_EXITCODE_XSETBV:
+		len = 3;
+		break;
+	default:
+		return;
+	}
+	vmcb->ctrl.nrip = vmcb->state.rip + len;
+}
+#endif
+
 static int
 svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
     struct nvmm_vcpu_exit *exit)
@@ -1791,6 +1829,9 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 
 		svm_vcpu_guest_fpu_enter(vcpu);
 		svm_vmrun(cpudata->vmcb_pa, cpudata->gprs, hgdt);
+#if defined(NVMM_TEST_NO_NRIPS)
+		svm_test_fake_nrip(vmcb);
+#endif
 		svm_htlb_flush_ack(cpudata, machgen);
 		svm_vcpu_guest_fpu_leave(vcpu);
 		svm_stgi();
@@ -2803,10 +2844,12 @@ svm_ident(void)
 	}
 
 	/* Want nRIP. */
+#if !defined(NVMM_TEST_NO_NRIPS)
 	if (!(descs.edx & CPUID_8_0A_EDX_NRIPS)) {
 		os_printf("nvmm: SVM-NRIPS not supported\n");
 		return false;
 	}
+#endif
 
 	svm_decode_assist = (descs.edx & CPUID_8_0A_EDX_DecodeAssists) != 0;
 	if (!svm_decode_assist) {

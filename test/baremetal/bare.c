@@ -154,6 +154,7 @@ bare_vprintf(const char *fmt, va_list ap)
 	for (; *fmt != '\0'; fmt++) {
 		int lng = 0, width = 0;
 		char pad = ' ';
+		bool left = false, alt = false;
 
 		if (*fmt != '%') {
 			if (*fmt == '\n')
@@ -162,11 +163,15 @@ bare_vprintf(const char *fmt, va_list ap)
 			continue;
 		}
 		fmt++;
-		if (*fmt == '#')
-			fmt++;
-		if (*fmt == '0') {
-			pad = '0';
-			fmt++;
+		for (;; fmt++) {
+			if (*fmt == '#')
+				alt = true;
+			else if (*fmt == '-')
+				left = true;
+			else if (*fmt == '0')
+				pad = '0';
+			else
+				break;
 		}
 		while (*fmt >= '0' && *fmt <= '9')
 			width = width * 10 + (*fmt++ - '0');
@@ -179,10 +184,17 @@ bare_vprintf(const char *fmt, va_list ap)
 		case 's': {
 			const char *s = va_arg(ap, const char *);
 
+			int n;
+
 			if (s == NULL)
 				s = "(null)";
+			n = (int)strlen(s);
+			for (; !left && n < width; n++)
+				serial_putc(' ');
 			while (*s != '\0')
 				serial_putc(*s++);
+			for (; left && n < width; n++)
+				serial_putc(' ');
 			break;
 		}
 		case 'c':
@@ -202,6 +214,10 @@ bare_vprintf(const char *fmt, va_list ap)
 			break;
 		case 'x':
 		case 'X':
+			if (alt) {
+				serial_putc('0');
+				serial_putc('x');
+			}
 			put_num(lng ? va_arg(ap, uint64_t) :
 			    va_arg(ap, unsigned int), 16, width, pad, false);
 			break;

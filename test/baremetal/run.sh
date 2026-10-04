@@ -20,25 +20,30 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 	docker build -q -t "$IMAGE" "$ROOT/test/baremetal/docker" >/dev/null
 fi
 
-set +e
-docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" sh -c '
-	set -e
+# Link first, as its own step: a link failure must never be mistaken for a
+# test result.
+docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" \
 	ld.lld -m elf_x86_64 -nostdlib -static -z max-page-size=4096 \
 	    -T test/baremetal/linker.ld -o build/bare/nvmm-test.elf \
-	    build/bare/*.o
-	exec timeout 180 qemu-system-x86_64 \
-	    -machine q35 -accel tcg -cpu "$0" -m 512 \
+	    $(cd "$ROOT" && ls build/bare/*.o)
+
+LOG="$ROOT/build/bare/nvmm-test.log"
+set +e
+docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" \
+	timeout 180 qemu-system-x86_64 \
+	    -machine q35 -accel tcg -cpu "$CPU" -m 512 \
 	    -display none -serial stdio -monitor none -no-reboot \
 	    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-	    -kernel build/bare/nvmm-test.elf "$@"
-' "$CPU" "$@"
-status=$?
+	    -kernel build/bare/nvmm-test.elf "$@" 2>&1 | tee "$LOG" |
+	grep -v "TCG doesn't support requested feature"
 set -e
 
-# isa-debug-exit turns a guest-written value v into exit status (v << 1) | 1.
-case "$status" in
-	1) echo "test kernel: PASS"; exit 0 ;;
-	3) echo "test kernel: FAIL (a check failed; see the log above)" >&2; exit 1 ;;
-	124) echo "test kernel: FAIL (timed out)" >&2; exit 1 ;;
-	*) echo "test kernel: FAIL (emulator exited with status $status)" >&2; exit 1 ;;
-esac
+# The kernel prints this line only after every check has passed, and then asks
+# the emulator to exit. Trust the line, not an exit status that other failures
+# could also produce.
+if grep -q "^ALL TESTS PASSED" "$LOG"; then
+	echo "test kernel: PASS"
+	exit 0
+fi
+echo "test kernel: FAIL (see $LOG)" >&2
+exit 1

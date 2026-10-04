@@ -37,7 +37,7 @@ BARE_DIR	:= $(BUILD)/bare
 BARE_CFLAGS	:= -target x86_64-unknown-none-elf -ffreestanding -fno-pic \
 		   -mno-red-zone -mgeneral-regs-only -fno-stack-protector \
 		   -fno-builtin -O2 -g $(WARN) -Werror \
-		   -D_KERNEL -DNVMM_PORT $(COMMON_INC) \
+		   -D_KERNEL -DNVMM_PORT -DNVMM_TEST_NO_NRIPS $(COMMON_INC) \
 		   -Itest/baremetal -Itest/baremetal/include
 BARE_SRCS	:= $(CORE_SRCS) $(PORT_SRCS) \
 		   test/baremetal/bare.c test/baremetal/test_main.c

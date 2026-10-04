@@ -92,16 +92,119 @@ get_gpr(int reg)
 	return comm->state.gprs[reg];
 }
 
+/*
+ * Host state that a world switch disturbs and the engine must put back.
+ * VMRUN restores only part of it by itself; the rest is the job of the
+ * VMSAVE/VMLOAD pair in svm_vmrun() and of the engine's MSR bookkeeping.
+ */
+struct host_state {
+	uint64_t fsbase, gsbase, kgsbase;
+	uint64_t star, lstar, cstar, sfmask;
+	uint64_t efer, cr0, cr3, cr4, xcr0, dr7;
+	uint16_t tr, ldt, ds, es, fs, gs;
+};
+
+static void
+host_state_read(struct host_state *h)
+{
+	h->fsbase = rdmsr(MSR_FSBASE);
+	h->gsbase = rdmsr(MSR_GSBASE);
+	h->kgsbase = rdmsr(MSR_KERNELGSBASE);
+	h->star = rdmsr(MSR_STAR);
+	h->lstar = rdmsr(MSR_LSTAR);
+	h->cstar = rdmsr(MSR_CSTAR);
+	h->sfmask = rdmsr(MSR_SFMASK);
+	h->efer = rdmsr(MSR_EFER);
+	h->cr0 = x86_get_cr0();
+	h->cr3 = x86_get_cr3();
+	h->cr4 = x86_get_cr4();
+	h->xcr0 = (x86_xsave_features != 0) ? x86_get_xcr(0) : 0;
+	h->dr7 = x86_get_dr7();
+	__asm volatile ("str %0" : "=r" (h->tr));
+	__asm volatile ("sldt %0" : "=r" (h->ldt));
+	__asm volatile ("movw %%ds,%0" : "=r" (h->ds));
+	__asm volatile ("movw %%es,%0" : "=r" (h->es));
+	__asm volatile ("movw %%fs,%0" : "=r" (h->fs));
+	__asm volatile ("movw %%gs,%0" : "=r" (h->gs));
+}
+
+/* Distinctive values, so "restored" cannot be confused with "still zero". */
+static void
+host_state_seed(void)
+{
+	wrmsr(MSR_FSBASE, 0x0000111111111000ULL);
+	wrmsr(MSR_GSBASE, 0x0000222222222000ULL);
+	wrmsr(MSR_KERNELGSBASE, 0x0000333333333000ULL);
+	wrmsr(MSR_STAR, 0x0023001000000000ULL);
+	wrmsr(MSR_LSTAR, 0xFFFFFFFF80444000ULL);
+	wrmsr(MSR_CSTAR, 0xFFFFFFFF80555000ULL);
+	wrmsr(MSR_SFMASK, 0x0000000000047700ULL);
+}
+
 static struct nvmm_vcpu_exit *
 run(void)
 {
 	static struct nvmm_ioc_vcpu_run args;
+	struct host_state before, after;
 
 	memset(&args, 0, sizeof(args));
 	args.machid = machid;
 	args.cpuid = 0;
+
+	host_state_read(&before);
 	CHECK_EQ(ioc(NVMM_IOC_VCPU_RUN, &args), 0);
+	host_state_read(&after);
+
+	CHECK_EQ(after.fsbase, before.fsbase);
+	CHECK_EQ(after.gsbase, before.gsbase);
+	CHECK_EQ(after.kgsbase, before.kgsbase);
+	CHECK_EQ(after.star, before.star);
+	CHECK_EQ(after.lstar, before.lstar);
+	CHECK_EQ(after.cstar, before.cstar);
+	CHECK_EQ(after.sfmask, before.sfmask);
+	CHECK_EQ(after.efer, before.efer);
+	CHECK_EQ(after.cr0, before.cr0);
+	CHECK_EQ(after.cr3, before.cr3);
+	CHECK_EQ(after.cr4, before.cr4);
+	CHECK_EQ(after.xcr0, before.xcr0);
+	CHECK_EQ(after.dr7, before.dr7);
+	CHECK_EQ(after.tr, before.tr);
+	CHECK_EQ(after.ldt, before.ldt);
+	CHECK_EQ(after.ds, before.ds);
+	CHECK_EQ(after.es, before.es);
+	CHECK_EQ(after.fs, before.fs);
+	CHECK_EQ(after.gs, before.gs);
+	CHECK(!port_preempt_disabled());
+
 	return &args.exit;
+}
+
+/* Run, and say what happened if it is not what the test wanted. */
+static struct nvmm_vcpu_exit *
+run_expect(uint64_t reason)
+{
+	struct nvmm_vcpu_exit *exit = run();
+
+	if (exit->reason != reason) {
+		port_printf("\nunexpected exit: reason %#lx (wanted %#lx)\n",
+		    exit->reason, reason);
+		if (exit->reason == NVMM_VCPU_EXIT_MEMORY)
+			port_printf("  memory: gpa %#lx prot %d\n",
+			    exit->u.mem.gpa, exit->u.mem.prot);
+		if (exit->reason == NVMM_VCPU_EXIT_INVALID)
+			port_printf("  hardware exit code %#lx\n",
+			    exit->u.inv.hwcode);
+		get_state(NVMM_X64_STATE_GPRS | NVMM_X64_STATE_SEGS |
+		    NVMM_X64_STATE_CRS);
+		port_printf("  rip %#lx cs.base %#lx ds.base %#lx cr0 %#lx "
+		    "cr4 %#lx\n", comm->state.gprs[NVMM_X64_GPR_RIP],
+		    comm->state.segs[NVMM_X64_SEG_CS].base,
+		    comm->state.segs[NVMM_X64_SEG_DS].base,
+		    comm->state.crs[NVMM_X64_CR_CR0],
+		    comm->state.crs[NVMM_X64_CR_CR4]);
+	}
+	CHECK_EQ(exit->reason, reason);
+	return exit;
 }
 
 static void
@@ -201,8 +304,7 @@ test_io_and_hlt(void)
 	load(0x1000, code, sizeof(code));
 	set_rip(0x1000);
 
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_IO);
+	exit = run_expect(NVMM_VCPU_EXIT_IO);
 	CHECK_EQ(exit->u.io.port, 0x80);
 	CHECK_EQ(exit->u.io.in, false);
 	CHECK_EQ(exit->u.io.operand_size, 1);
@@ -211,9 +313,9 @@ test_io_and_hlt(void)
 	CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x1002);
 
 	set_rip(exit->u.io.npc);
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_HALTED);
-	CHECK_EQ(exit->u.insn.npc, 0x1008);
+	exit = run_expect(NVMM_VCPU_EXIT_HALTED);
+	/* The engine steps past HLT itself; there is nothing to resume. */
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x1008);
 	CHECK_EQ(get_gpr(NVMM_X64_GPR_RBX) & 0xFFFF, 0x1234);
 }
 
@@ -237,8 +339,7 @@ test_memory(void)
 	load(0x2000, code, sizeof(code));
 	set_rip(0x2000);
 
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_MEMORY);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
 	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
 	CHECK((exit->u.mem.prot & PROT_WRITE) != 0);
 	CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x2005);
@@ -246,23 +347,20 @@ test_memory(void)
 	/* Back the address with memory and let the write happen. */
 	gpa_map(RAM_SIZE, MMIO_GPA, 0x1000, PROT_READ | PROT_WRITE);
 	CHECK_EQ(ram[RAM_SIZE], 0x00);
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_HALTED);
+	exit = run_expect(NVMM_VCPU_EXIT_HALTED);
 	CHECK_EQ(ram[RAM_SIZE], 0x55);
 
 	/* Take the memory away again: the write must fault once more. */
 	ram[RAM_SIZE] = 0;
 	gpa_unmap(MMIO_GPA, 0x1000);
 	set_rip(0x2005);
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_MEMORY);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
 	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
 	CHECK_EQ(ram[RAM_SIZE], 0x00);
 
 	/* Read-only memory: reads would work, the write still faults. */
 	gpa_map(RAM_SIZE, MMIO_GPA, 0x1000, PROT_READ);
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_MEMORY);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
 	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
 	CHECK((exit->u.mem.prot & PROT_WRITE) != 0);
 	CHECK_EQ(ram[RAM_SIZE], 0x00);
@@ -285,14 +383,12 @@ test_cpuid(void)
 		0x0F, 0xA2,				/* cpuid                */
 		0xF4,					/* hlt                  */
 	};
-	struct nvmm_vcpu_exit *exit;
 	uint32_t sig[3];
 
 	load(0x3000, code, sizeof(code));
 	set_rip(0x3000);
 
-	exit = run();
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_HALTED);
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
 	sig[0] = (uint32_t)get_gpr(NVMM_X64_GPR_RBX);
 	sig[1] = (uint32_t)get_gpr(NVMM_X64_GPR_RCX);
 	sig[2] = (uint32_t)get_gpr(NVMM_X64_GPR_RDX);
@@ -319,17 +415,18 @@ test_fpu(void)
 	};
 	static const uint8_t expect[4] = { 0xEF, 0xBE, 0xAD, 0xDE };
 	const uint64_t host_pattern = 0x1122334455667788ULL;
-	struct nvmm_vcpu_exit *exit;
 	uint64_t host_after;
 
 	load(0x4000, code, sizeof(code));
 	set_rip(0x4000);
 
+	/*
+	 * The test kernel is built without SSE code generation, so nothing
+	 * between these two statements touches %xmm0 except the engine.
+	 */
 	__asm volatile ("movq %0,%%xmm0" : : "r" (host_pattern));
-	exit = run();
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
 	__asm volatile ("movq %%xmm0,%0" : "=r" (host_after));
-
-	CHECK_EQ(exit->reason, NVMM_VCPU_EXIT_HALTED);
 	CHECK_EQ(host_after, host_pattern);
 
 	get_state(NVMM_X64_STATE_FPU);
@@ -424,6 +521,7 @@ kmain(void)
 	bare_init(256ULL << 20);
 	port_printf("\nnvmm bare-metal test kernel\n");
 	report_cpu();
+	host_state_seed();
 
 	/* Twice over: the second pass catches state left behind by the first. */
 	for (pass = 1; pass <= 2; pass++) {
