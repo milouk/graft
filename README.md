@@ -21,10 +21,16 @@ before trusting any of it.
 | Nested page table builder (`port/npt.c`) | Unit tested, and exercised by the engine tests |
 | Guest-memory layer (`port/nvmm_port_vm.c`) | Exercised by the engine tests, with leak accounting |
 | World-switch assembly (host VMCB variant) | Exercised by the engine tests; host state checked after every guest run |
-| macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported on macOS 15 and 10.15 |
+| macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
 | Engine and glue together, on an AMD CPU | **Never run** |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
 | QEMU with `-accel nvmm` on macOS | Builds (`tools/build-qemu.sh`) and starts a machine through the driver on real Sequoia, with the stand-in engine. **Has never run guest code** |
+
+**macOS versions.** One binary is meant to serve macOS 10.13 (the first with
+AMD Ryzen support in the Hackintosh world) through 15. What that rests on:
+the kext imports only exported symbols, and `tools/check-kpi.sh` confirms
+each of them against the kernel sources of every release in that range. It
+has been *loaded* on 15.7.9 only.
 
 What the tests cannot show, because the emulator hides it:
 
@@ -50,7 +56,10 @@ darwin/     the macOS kernel extension: platform hooks, /dev/nvmm, load/unload
 test/unit       userspace test for the page table builder
 test/baremetal  a freestanding kernel that boots in QEMU and drives the engine
 test/mutation   deliberate bugs, to check that the tests can fail
-tools/      check-kpi.sh
+test/darwin     programs that drive a loaded kext: the glue self-test, libnvmm
+                against the stand-in engine, and the first real guests
+lib/        libnvmm
+tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
 ```
 
 `diff -ru upstream/sys/dev/virtual/nvmm src` shows exactly what was changed in
@@ -65,6 +74,8 @@ make unit         # page table builder, with sanitizers
 make test-bare    # link the test kernel and boot it under emulated AMD-V
 make kext         # build/NVMM.kext, x86_64
 make check        # all three
+make release      # build/release/NVMM.kext, stripped (about 50 KB)
+make guest-test   # nvmm-guest-test: the first real guests, for an AMD machine
 make libnvmm      # the userland library and headers
 make selftest     # the self-test kext (stand-in engine) and its test programs
 ./tools/build-qemu.sh   # QEMU with the nvmm accelerator; run on an x86_64 Mac
@@ -75,6 +86,10 @@ make selftest     # the self-test kext (stand-in engine) and its test programs
 All of it runs on an Apple Silicon Mac. `make test-bare` builds a small Docker
 image holding `lld` and `qemu-system-x86_64`; remove it with
 `docker rmi nvmm-darwin-test`.
+
+Pushing a tag that starts with `v` runs `.github/workflows/release.yml`,
+which builds the stripped kext, repeats the symbol check for every macOS
+release, and attaches the result to a GitHub pre-release.
 
 ## How it differs from NVMM on BSD
 
@@ -94,12 +109,17 @@ So this port uses only exported interfaces, and pays for it in a few places:
 - **Preemption is held off with a spin lock.** macOS does not export its
   preemption-disable primitive, but holding a spin lock has the same effect, so
   there is one per CPU.
-- **The vCPU loop returns to userland after every exit.** macOS offers no way
-  for an extension to ask whether the scheduler or a signal is waiting. This
-  costs a system call for exits the engine could have handled alone.
+- **The vCPU loop is bounded.** macOS offers no way for an extension to ask
+  whether the scheduler or a signal is waiting, so the loop cannot stay in the
+  kernel until one is. It handles up to 32 exits by itself, and returns to
+  userland at once on a host interrupt or when that budget is spent.
 - **`/dev/nvmm` is a cloning device**, so that each open gets its own minor
   and machines can be tied to the open that created them.
-- **4K pages only** in the nested page table, for now.
+- **2M pages when the memory allows.** A guest buffer of 2M or more is built
+  from 2M-aligned, host-contiguous runs, as many as the system gives within
+  two seconds, with ordinary pages for the rest. Each run that lines up with
+  the guest address becomes one 2M entry in the nested page table, and is
+  split back into 4K pages if part of it is later unmapped.
 
 ## The glue self-test
 
@@ -178,8 +198,20 @@ Linux/KVM with AMD-V passed through.
    `/dev/nvmm`.
 5. Unload with `sudo kextunload NVMM.kext`.
 
-The first thing to exercise after that is a userland port of the checks in
-`test/baremetal/test_main.c`: the same guest programs, through real ioctls.
+Then run `nvmm-guest-test` (`make guest-test`), over ssh so that the last
+line printed survives a panic. It is the checks of
+`test/baremetal/test_main.c` through libnvmm, in stages:
+
+```
+sudo ./nvmm-guest-test 1   # open the device. No guest runs
+sudo ./nvmm-guest-test 2   # + machines and vCPUs. No guest runs
+sudo ./nvmm-guest-test 3   # + the first VMRUN: a guest that halts
+sudo ./nvmm-guest-test 4   # + I/O, memory faults, CPUID, FPU, 2M pages
+sudo ./nvmm-guest-test     # + long runs, two guests at once, 200 machines
+```
+
+Stage 4 is where the two things emulation hides get their first test: TLB
+flushing after an unmap, and next-RIP save.
 
 ## Known gaps
 
@@ -196,5 +228,6 @@ The first thing to exercise after that is a userland port of the checks in
 
 ## Licence
 
-The imported files carry their original two-clause BSD licence headers. New
-files in this repository are offered under the same terms.
+Two-clause BSD; see `LICENSE`. The imported files carry their original
+headers. QEMU is not part of this repository and is not distributed with it:
+`tools/build-qemu.sh` downloads it and changes one line of its build.

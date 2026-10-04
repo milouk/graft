@@ -20,7 +20,7 @@ COMMON_INC	:= -Iport -Iport/compat -Isrc
 WARN		:= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 		   -Wno-missing-field-initializers
 
-.PHONY: all check unit bare test-bare kext release selftest libnvmm clean
+.PHONY: all check unit bare test-bare kext release selftest guest-test libnvmm clean
 all: check
 check: unit test-bare kext
 
@@ -71,7 +71,7 @@ KHDR		:= $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 KEXT_DIR	:= $(BUILD)/kext
 KEXT_BUNDLE	:= $(BUILD)/NVMM.kext
 KEXT_COMMON	:= -arch x86_64 -mkernel -nostdinc -fno-builtin \
-		   -fno-stack-protector -mmacosx-version-min=10.15 \
+		   -fno-stack-protector -mmacosx-version-min=10.13 \
 		   -isysroot $(SDK) -isystem $(KHDR) \
 		   -DKERNEL -DKERNEL_PRIVATE -D_KERNEL -DAPPLE -DNeXT \
 		   -DNVMM_PORT $(COMMON_INC) -Idarwin -O2 -g $(WARN) -Werror \
@@ -108,7 +108,7 @@ $(KEXT_DIR)/%.o: %.cpp
 $(KEXT_BUNDLE)/Contents/MacOS/NVMM: $(KEXT_OBJS) darwin/Info.plist
 	@mkdir -p $(KEXT_BUNDLE)/Contents/MacOS
 	clang++ -arch x86_64 -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
-	    -mmacosx-version-min=10.15 -isysroot $(SDK) \
+	    -mmacosx-version-min=10.13 -isysroot $(SDK) \
 	    -o $@ $(KEXT_OBJS) -lkmod -lkmodc++ -lcc_kext
 	cp darwin/Info.plist $(KEXT_BUNDLE)/Contents/Info.plist
 
@@ -154,7 +154,7 @@ $(ST_DIR)/%.o: %.cpp
 $(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest: $(ST_OBJS) darwin/Info.plist
 	@mkdir -p $(ST_BUNDLE)/Contents/MacOS
 	clang++ -arch x86_64 -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
-	    -mmacosx-version-min=10.15 -isysroot $(SDK) \
+	    -mmacosx-version-min=10.13 -isysroot $(SDK) \
 	    -o $@ $(ST_OBJS) -lkmod -lkmodc++ -lcc_kext
 	sed -e 's/org\.nvmm\.driver\.NVMM/org.nvmm.driver.NVMMSelfTest/' \
 	    -e 's|<string>NVMM</string>|<string>NVMMSelfTest</string>|' \
@@ -162,7 +162,7 @@ $(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest: $(ST_OBJS) darwin/Info.plist
 
 $(ST_TOOL): test/darwin/selftest.c darwin/nvmm_selftest_ioctl.h
 	@mkdir -p $(BUILD)
-	$(CC) -arch x86_64 -mmacosx-version-min=10.15 -O2 -Wall -Wextra -Werror \
+	$(CC) -arch x86_64 -mmacosx-version-min=10.13 -O2 -Wall -Wextra -Werror \
 	    -Idarwin -o $@ test/darwin/selftest.c
 
 # ------------------------------------------------------------ libnvmm (macOS)
@@ -170,7 +170,7 @@ $(ST_TOOL): test/darwin/selftest.c darwin/nvmm_selftest_ioctl.h
 # out the way an emulator expects to find them: <nvmm.h> on the include path.
 INC_DIR		:= $(BUILD)/include
 LIBNVMM		:= $(BUILD)/libnvmm.a
-USER_CFLAGS	:= -arch x86_64 -mmacosx-version-min=10.15 -O2 -Wall -Wextra \
+USER_CFLAGS	:= -arch x86_64 -mmacosx-version-min=10.13 -O2 -Wall -Wextra \
 		   -Wno-unused-parameter -Wno-sign-compare -Werror \
 		   -I$(INC_DIR)
 LIB_HEADERS	:= $(INC_DIR)/nvmm.h $(INC_DIR)/dev/nvmm/nvmm.h \
@@ -192,6 +192,13 @@ $(INC_DIR)/sys/bitops.h: port/compat/sys/bitops.h
 $(LIBNVMM): lib/libnvmm.c lib/libnvmm_x86.c lib/libnvmm_darwin.h $(LIB_HEADERS)
 	$(CC) $(USER_CFLAGS) -Ilib -c lib/libnvmm.c -o $(BUILD)/libnvmm.o
 	rm -f $@ && ar rcs $@ $(BUILD)/libnvmm.o
+
+# The first real guests. Needs NVMM.kext loaded on an AMD machine.
+GUEST_TOOL	:= $(BUILD)/nvmm-guest-test
+guest-test: $(GUEST_TOOL)
+$(GUEST_TOOL): test/darwin/nvmm-guest-test.c $(LIBNVMM)
+	@mkdir -p $(BUILD)
+	$(CC) $(USER_CFLAGS) -o $@ test/darwin/nvmm-guest-test.c $(LIBNVMM)
 
 $(FAKE_TOOL): test/darwin/nvmm-fake-test.c darwin/nvmm_fake_engine.h $(LIBNVMM)
 	@mkdir -p $(BUILD)

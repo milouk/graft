@@ -3,8 +3,8 @@
 #
 # The runner is Apple Silicon; the kext is cross-compiled for x86_64. Nothing
 # here can load it, so the release only proves that it builds, that the page
-# table tests pass, and that every symbol it imports is exported by macOS 15
-# and by macOS 10.15.
+# table tests pass, and that every symbol it imports is exported by every
+# macOS from 10.13 on.
 name: release
 
 on:
@@ -28,11 +28,16 @@ jobs:
       - name: Build
         run: make release SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
-      - name: Imported symbols exist on macOS 15 and 10.15
+      # One kernel per macOS release, 10.13 to 15 and the one after.
+      - name: Imported symbols exist on every supported macOS
         run: |
           export NVMM_KEXT=build/release/NVMM.kext/Contents/MacOS/NVMM
-          ./tools/check-kpi.sh
-          ./tools/check-kpi.sh xnu-6153.141.1
+          for tag in xnu-4570.71.2 xnu-4903.270.47 xnu-6153.141.1 \
+              xnu-7195.141.2 xnu-8020.140.41 xnu-8796.141.3 \
+              xnu-10063.141.1 xnu-11417.140.69 xnu-12377.121.6; do
+            echo "== $tag"
+            ./tools/check-kpi.sh "$tag"
+          done
 
       - name: Package
         run: |

@@ -84,6 +84,11 @@ while [ $i -le $ROUNDS ]; do
 	i=$((i + 1))
 done
 
+if [ -x "$DIR/nvmm-guest-test" ]; then
+	say "real-guest test, the stages that run no guest"
+	sudo "$DIR/nvmm-guest-test" 2 || bad "nvmm-guest-test stages 1-2"
+fi
+
 if [ -n "$QEMU" ] && [ -x "$QEMU" ]; then
 	for machine in q35 microvm; do
 		say "QEMU -accel nvmm -M $machine -m 1G"
