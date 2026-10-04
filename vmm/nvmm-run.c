@@ -974,7 +974,7 @@ net_tx(struct virtio_dev *d)
 			memcpy(frame + len, p, l);
 			len += l;
 		}
-		if (len > 0 && len <= d->max_packet) {
+		if (len > 0 && len <= d->max_packet && d->iface != NULL) {
 			out.iov_base = frame;
 			out.iov_len = len;
 			memset(&pkt, 0, sizeof(pkt));
@@ -1012,6 +1012,10 @@ net_rx(struct virtio_dev *d)
 		if (n <= 0)
 			return;
 
+		if (d->iface == NULL) {
+			q->last_avail = last;
+			return;
+		}
 		in.iov_base = frame + NET_HDR_LEN;
 		in.iov_len = d->max_packet;
 		memset(&pkt, 0, sizeof(pkt));
@@ -1048,6 +1052,36 @@ net_notify(struct virtio_dev *d, unsigned int qi)
 		net_rx(d);
 }
 
+/* The device itself, behind whatever carries its frames. */
+static void
+net_finish(struct virtio_dev *d, const uint8_t *mac, char *cmdline,
+    size_t cmdlen)
+{
+	d->id = VIRTIO_ID_NET;
+	d->irq = 5 + (int)nvdevs;
+	d->features = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC;
+	d->notify = net_notify;
+	memcpy(d->config, mac, 6);
+	netdev = d;
+
+	snprintf(cmdline + strlen(cmdline), cmdlen - strlen(cmdline),
+	    " virtio_mmio.device=4K@%#llx:%d",
+	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
+	nvdevs++;
+}
+
+/* A card with the cable unplugged: for testing the device without root. */
+static void
+net_add_unplugged(char *cmdline, size_t cmdlen)
+{
+	static const uint8_t mac[6] = { 0x02, 0x4E, 0x56, 0x4D, 0x4D, 0x01 };
+	struct virtio_dev *d = &vdevs[nvdevs];
+
+	d->iface = NULL;
+	d->max_packet = 1514;
+	net_finish(d, mac, cmdline, cmdlen);
+}
+
 static void
 net_add(char *cmdline, size_t cmdlen)
 {
@@ -1079,8 +1113,9 @@ net_add(char *cmdline, size_t cmdlen)
 		}
 		dispatch_semaphore_signal(sem);
 	});
-	if (d->iface != NULL)
-		dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+	if (d->iface != NULL && dispatch_semaphore_wait(sem,
+	    dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0)
+		die("vmnet did not answer within 20 seconds");
 	if (d->iface == NULL || status != VMNET_SUCCESS)
 		die("cannot start a vmnet interface (status %d); the network "
 		    "needs root", (int)status);
@@ -1095,19 +1130,12 @@ net_add(char *cmdline, size_t cmdlen)
 		pthread_kill(vcpu_thread, SIGUSR1);
 	});
 
-	d->id = VIRTIO_ID_NET;
-	d->irq = 5 + (int)nvdevs;
-	d->features = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC;
-	d->notify = net_notify;
 	d->max_packet = (maxpkt != 0 && maxpkt <= 65536 - NET_HDR_LEN) ?
 	    (size_t)maxpkt : 1514;
-	memcpy(d->config, mac, 6);
-	netdev = d;
-
-	snprintf(cmdline + strlen(cmdline), cmdlen - strlen(cmdline),
-	    " virtio_mmio.device=4K@%#llx:%d",
-	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
-	nvdevs++;
+	fprintf(stderr, "nvmm-run: network up, MAC "
+	    "%02x:%02x:%02x:%02x:%02x:%02x, largest frame %zu\n", mac[0],
+	    mac[1], mac[2], mac[3], mac[4], mac[5], d->max_packet);
+	net_finish(d, mac, cmdline, cmdlen);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1577,15 +1605,16 @@ main(int argc, char **argv)
 	size_t len = sizeof(tsc_hz);
 	pthread_t kick;
 	long mb = 512;
-	bool want_net = false;
+	bool want_net = false, unplugged = false;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:d:nm:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:nNm:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
 		case 'd': dpath = optarg; break;
 		case 'n': want_net = true; break;
+		case 'N': want_net = unplugged = true; break;
 		case 'm': mb = atol(optarg); break;
 		case 'a': extra = optarg; break;
 		case 'v': verbose = true; break;
@@ -1650,7 +1679,9 @@ main(int argc, char **argv)
 
 	if (dpath != NULL)
 		blk_add(dpath, cmdline, sizeof(cmdline));
-	if (want_net)
+	if (want_net && unplugged)
+		net_add_unplugged(cmdline, sizeof(cmdline));
+	else if (want_net)
 		net_add(cmdline, sizeof(cmdline));
 	snprintf(cmdline + strlen(cmdline), sizeof(cmdline) - strlen(cmdline),
 	    " %s", extra);
