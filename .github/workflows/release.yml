@@ -1,0 +1,62 @@
+# Build NVMM.kext and attach it to a GitHub release when a version tag is
+# pushed:  git tag v0.1.0 && git push origin v0.1.0
+#
+# The runner is Apple Silicon; the kext is cross-compiled for x86_64. Nothing
+# here can load it, so the release only proves that it builds, that the page
+# table tests pass, and that every symbol it imports is exported by macOS 15
+# and by macOS 10.15.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  kext:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: make unit SDK="$(xcrun --sdk macosx --show-sdk-path)"
+
+      - name: Build
+        run: make release SDK="$(xcrun --sdk macosx --show-sdk-path)"
+
+      - name: Imported symbols exist on macOS 15 and 10.15
+        run: |
+          export NVMM_KEXT=build/release/NVMM.kext/Contents/MacOS/NVMM
+          ./tools/check-kpi.sh
+          ./tools/check-kpi.sh xnu-6153.141.1
+
+      - name: Package
+        run: |
+          file build/release/NVMM.kext/Contents/MacOS/NVMM | grep -q x86_64
+          cd build/release
+          cp ../../LICENSE .
+          zip="NVMM-${GITHUB_REF_NAME}.kext.zip"
+          zip -qry "$zip" NVMM.kext LICENSE
+          shasum -a 256 "$zip" | tee "$zip.sha256"
+
+      - name: Release
+        run: |
+          cat > notes.md <<'NOTES'
+          `NVMM.kext` for x86_64 Macs with an AMD CPU, built from this tag.
+
+          **Experimental.** This is a kernel extension: a bug in it panics
+          the machine. Read the Status section of the README before loading
+          it, and load it at run time (`kmutil load -p` / `kextutil`), never
+          from the bootloader. It is not signed, so it needs a system that
+          accepts unsigned kernel extensions.
+
+          QEMU is not included; build it with `tools/build-qemu.sh`.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" --prerelease --notes-file notes.md \
+            build/release/NVMM-"$GITHUB_REF_NAME".kext.zip \
+            build/release/NVMM-"$GITHUB_REF_NAME".kext.zip.sha256
