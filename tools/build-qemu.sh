@@ -6,10 +6,11 @@
 # it on NetBSD. This downloads a QEMU release, widens that one check to macOS,
 # and builds it against this repository's libnvmm.
 #
-# Run it on the Intel or AMD Mac that will use it. It needs Homebrew, for
-# QEMU's own dependencies:
+# Run it on the Intel or AMD Mac that will use it. QEMU's own dependencies
+# come from MacPorts; Homebrew no longer installs on x86_64 Macs.
 #
-#   brew install pkg-config ninja glib pixman python
+#   sudo port -N install pkgconfig ninja glib2 libpixman python313
+#   sudo port select --set python3 python313
 #
 # Usage:  ./tools/build-qemu.sh [qemu-version]      default: 11.1.2
 #
@@ -24,6 +25,12 @@ WORK="$ROOT/build/qemu"
 SRC="$WORK/qemu-$VERSION"
 TARBALL="$WORK/qemu-$VERSION.tar.xz"
 
+# MacPorts lives in /opt/local and is not always on a non-login shell's PATH.
+PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+export PATH
+PKG_CONFIG_PATH="/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export PKG_CONFIG_PATH
+
 if [ "$(uname -m)" != "x86_64" ]; then
 	echo "ERROR: this builds for x86_64 Macs; this machine is $(uname -m)." >&2
 	exit 1
@@ -31,13 +38,14 @@ fi
 
 for tool in pkg-config ninja python3; do
 	command -v "$tool" >/dev/null 2>&1 || {
-		echo "ERROR: $tool not found. Run:" >&2
-		echo "  brew install pkg-config ninja glib pixman python" >&2
+		echo "ERROR: $tool not found. Install MacPorts, then run:" >&2
+		echo "  sudo port -N install pkgconfig ninja glib2 libpixman python313" >&2
+		echo "  sudo port select --set python3 python313" >&2
 		exit 1
 	}
 done
 pkg-config --exists glib-2.0 || {
-	echo "ERROR: glib not found. Run: brew install glib pixman" >&2
+	echo "ERROR: glib not found. Run: sudo port -N install glib2 libpixman" >&2
 	exit 1
 }
 
@@ -79,6 +87,7 @@ echo "==> configuring"
 mkdir -p "$SRC/build"
 cd "$SRC/build"
 ../configure \
+    --python="$(command -v python3)" \
     --target-list=x86_64-softmmu \
     --enable-nvmm \
     --disable-docs \
