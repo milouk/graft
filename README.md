@@ -29,7 +29,7 @@ before trusting any of it.
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
 | Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
-| `nvmm-run`, a small VMM of our own (`vmm/`) | Runs Docker for the Mac on the same Ryzen with no QEMU: Alpine boots from a disk image in about six seconds and a `docker` client on macOS runs containers in it. One vCPU; see its section for what is missing |
+| `nvmm-run`, a small VMM of our own (`vmm/`) | Runs Docker for the Mac on the same Ryzen with no QEMU: Alpine boots from a disk image in about six seconds and a `docker` client on macOS runs containers in it. One to four vCPUs; see its section for what is missing |
 | QEMU with `-accel nvmm` on macOS | QEMU 7.2.22 on macOS 10.15.5 boots Linux and runs Docker through the driver, one vCPU. QEMU 11 builds and starts a machine on macOS 15 against the stand-in engine, but has not run a guest. More than one vCPU per machine has never been tried |
 
 **macOS versions.** One binary is meant to serve macOS 10.13 (the first with
@@ -197,13 +197,17 @@ halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
 
 ## nvmm-run: Docker without QEMU
 
-`vmm/nvmm-run.c` is a virtual machine monitor of about 1,900 lines on
+`vmm/nvmm-run.c` is a virtual machine monitor of about 2,500 lines on
 libnvmm. It loads a Linux kernel directly (no firmware) and gives it a 16550
 serial console, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
 and virtio block and network devices on the memory-mapped transport. The
-kernel is told there is no ACPI, no PCI and no local APIC, which is what
-keeps it small: NVMM leaves every device to userland, and the local APIC is
-by far the largest. The price is a single virtual CPU.
+kernel is told there is no ACPI and no PCI, which is what keeps it small.
+
+With one virtual CPU there is no local APIC either. With more (`-c N`), each
+CPU has a local APIC and runs on its own thread, and the machine has an I/O
+APIC, described to the kernel by an MP table. NVMM leaves all of that to
+userland, so it is emulated here: the timer, fixed and lowest-priority
+interrupts, and the INIT and startup messages that bring the other CPUs up.
 
 `vmm/nvmm-docker` wraps it into a Docker host for the Mac:
 
@@ -239,7 +243,11 @@ did not reproduce.) What is not there yet:
 - Published ports are passed on for TCP only, and through a forwarder that
   closes a connection when either side half-closes.
 - No file sharing: `-v /a/mac/path:...` has nothing to mount.
-- One vCPU. More needs a local APIC and I/O APIC.
+- More than one vCPU works (two and four boot, and four busy loops run in
+  the time of one), but it is hours old: no long runs, no stress beyond that.
+  It is also the first time the driver has run several vCPUs in one machine.
+  The APICs are reached through the instruction emulator, which is slow; and
+  timers are served at one-millisecond resolution.
 - The guest cannot power itself off; it halts, and nvmm-run notices.
 - It has run for minutes, not days.
 
@@ -281,8 +289,9 @@ flushing after an unmap, and next-RIP save.
 
 ## Known gaps
 
-- More than one vCPU in a machine is untested, as are guests larger than
-  2 GB, long uptimes, and sleep and wake with a guest running.
+- Guests larger than 2 GB, long uptimes, and sleep and wake with a guest
+  running are untested. More than one vCPU in a machine has run only under
+  `nvmm-run`, for minutes.
 - A guest too large for the host to wire used to panic the host: the imported
   code assumed that allocation could not fail. It now returns ENOMEM, and
   the emulator tests cover it. Why a 4 GB guest could not be allocated on a

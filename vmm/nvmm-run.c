@@ -3,10 +3,13 @@
  *
  * It boots a Linux kernel directly, with no firmware, and gives it the least
  * a kernel needs: a serial console, the legacy interrupt controller, the
- * legacy timer and a clock. One virtual CPU. The kernel is told not to look
- * for anything else (no ACPI, no PCI, no local APIC), which is what keeps
- * this small: NVMM leaves every device to userland, and the local APIC is by
- * far the largest of them.
+ * legacy timer and a clock. The kernel is told not to look for anything else
+ * (no ACPI, no PCI), which is what keeps this small.
+ *
+ * With one virtual CPU, the default, there is no local APIC either: NVMM
+ * leaves every device to userland, and that is by far the largest of them.
+ * With more (-c), each CPU gets a local APIC and the machine an I/O APIC,
+ * described to the kernel by an MP table, and each CPU runs on a thread.
  *
  * A disk, if given, is a virtio block device: the kernel finds it through
  * its command line, which is how virtio's memory-mapped transport is used
@@ -20,7 +23,7 @@
  *
  * Usage (needs /dev/nvmm):
  *   nvmm-run -k vmlinuz [-i initramfs] [-d disk.img] [-n vmnet|socket]
- *            [-m megabytes] [-a "extra cmdline"]
+ *            [-c cpus] [-m megabytes] [-a "extra cmdline"]
  *
  * The console is this terminal. Ctrl-A then x quits.
  */
@@ -38,6 +41,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,10 +67,49 @@
 #define MEM_MAX_MB	3072		/* stay below the device hole */
 
 static struct nvmm_machine mach;
-static struct nvmm_vcpu vcpu;
 static uint8_t *ram;
 static uint64_t ram_size;
-static pthread_t vcpu_thread;
+
+/*
+ * One of these per virtual CPU. Everything in this file that is not marked
+ * otherwise is protected by 'big': a CPU's thread holds it whenever it is
+ * not inside the guest, and so do the timer and network threads when they
+ * touch a device.
+ */
+#define MAX_CPUS	16
+
+struct lapic {
+	uint32_t tpr, ldr, dfr, svr, esr, icr_lo, icr_hi;
+	uint32_t lvt[6];	/* timer, thermal, perf, LINT0, LINT1, error */
+	uint32_t isr[8], tmr[8], irr[8];
+	uint32_t divide, init_count;
+	uint64_t deadline_ns;	/* 0: the timer is not running */
+	uint64_t base_msr;
+};
+
+struct cpu {
+	unsigned int id;
+	struct nvmm_vcpu vcpu;
+	pthread_t thread;
+	pthread_cond_t cond;
+	struct lapic apic;
+	bool in_guest;		/* inside nvmm_vcpu_run() */
+	bool stopped;		/* halted with interrupts off */
+	bool wait_sipi;		/* an AP that has not been started */
+	bool sipi_pending;
+	bool nmi_pending;
+	uint8_t sipi_vector;
+	unsigned long nruns;
+};
+
+static struct cpu cpus[MAX_CPUS];
+static unsigned int ncpus = 1;
+static bool apic_mode;		/* more than one CPU */
+static pthread_mutex_t big = PTHREAD_MUTEX_INITIALIZER;
+
+static void cpu_wake(struct cpu *);
+static void ioapic_set_irq(int);
+static bool timer_irq_waiting(void);
 static volatile bool running = true;
 static int exit_code;
 static bool verbose;
@@ -112,6 +155,10 @@ static struct pic pics[2] = {
 	{ .imr = 0xFF, .base = 0x08 }, { .imr = 0xFF, .base = 0x70 },
 };
 
+/*
+ * A device raises its line. The line goes to the 8259s and, when there is
+ * one, to the I/O APIC; the guest decides which of the two it listens to.
+ */
 static void
 irq_raise(int line)
 {
@@ -119,6 +166,9 @@ irq_raise(int line)
 		pics[0].irr |= (uint8_t)(1u << line);
 	else
 		pics[1].irr |= (uint8_t)(1u << (line - 8));
+	if (apic_mode)
+		ioapic_set_irq(line);
+	cpu_wake(&cpus[0]);	/* the 8259s interrupt the first CPU */
 }
 
 /* The line one 8259 would deliver now, or -1. Lower numbers win. */
@@ -392,12 +442,30 @@ pit_poll(void)
 		return 0;
 	now = now_ns();
 	if (now >= c->next_irq_ns) {
+		/*
+		 * An interrupt request is one bit: a tick raised while the
+		 * last is still waiting to be taken would vanish into it.
+		 * Hold it back instead; it is made up below.
+		 */
+		if ((c->mode == 2 || c->mode == 3) && timer_irq_waiting())
+			return 1;
 		irq_raise(0);
 		if (c->mode == 2 || c->mode == 3) {
 			const uint64_t per = pit_period_ns(c);
 
-			/* Missed periods are dropped, not replayed. */
-			c->next_irq_ns += per * ((now - c->next_irq_ns) / per + 1);
+			/*
+			 * One period per call, so that a tick that came late
+			 * is made up for by the next coming early: the guest
+			 * measures other clocks against this one by counting
+			 * its interrupts. More than a few periods of debt is
+			 * written off, though: paid back in a burst, it would
+			 * make this clock run fast instead.
+			 */
+			c->next_irq_ns += per;
+			if (now > c->next_irq_ns + 4 * per)
+				c->next_irq_ns = now + per;
+			if (c->next_irq_ns <= now)
+				return 1;
 		} else {
 			c->next_irq_ns = 0;
 			return 0;
@@ -954,7 +1022,6 @@ struct net_backend {
 
 static struct virtio_dev *netdev;
 static struct net_backend net_be;
-static volatile bool net_rx_ready;
 
 /* Guest to host: each request is a header and one frame. */
 static void
@@ -1002,7 +1069,6 @@ net_rx(struct virtio_dev *d)
 
 	if (!q->ready || net_be.recv == NULL)
 		return;
-	net_rx_ready = false;
 
 	for (;;) {
 		unsigned int nout;
@@ -1062,12 +1128,13 @@ net_finish(struct virtio_dev *d, const uint8_t *mac, char *cmdline,
 	nvdevs++;
 }
 
-/* A new frame is waiting: get the vCPU thread to come and fetch it. */
+/* A new frame is waiting. Called on the backend's own thread. */
 static void
 net_wake(void)
 {
-	net_rx_ready = true;
-	pthread_kill(vcpu_thread, SIGUSR1);
+	pthread_mutex_lock(&big);
+	net_rx(netdev);
+	pthread_mutex_unlock(&big);
 }
 
 /* -- backend: nothing. A card with the cable unplugged, for testing. -- */
@@ -1333,6 +1400,488 @@ net_add_vmnet(char *cmdline, size_t cmdlen)
 }
 
 /* -------------------------------------------------------------------------- */
+/*
+ * Local APICs and the I/O APIC, for machines with more than one CPU.
+ *
+ * Only what Linux uses: fixed and lowest-priority interrupts, physical and
+ * flat logical destinations, the timer, and INIT and startup IPIs to bring
+ * the other CPUs up. The timer counts nanoseconds, so its "bus" runs at
+ * 1 GHz; the kernel measures that for itself.
+ */
+
+#define LAPIC_BASE	0xFEE00000ULL
+#define IOAPIC_BASE	0xFEC00000ULL
+#define IOAPIC_PINS	24
+
+#define LVT_TIMER	0
+#define LVT_LINT0	3
+#define LVT_MASKED	(1u << 16)
+#define LVT_PERIODIC	(1u << 17)
+
+static struct {
+	uint32_t regsel;
+	uint32_t id;
+	uint64_t rte[IOAPIC_PINS];
+} ioapic;
+
+static int
+bits_highest(const uint32_t *w)
+{
+	int i;
+
+	for (i = 7; i >= 0; i--) {
+		if (w[i] != 0)
+			return i * 32 + 31 - __builtin_clz(w[i]);
+	}
+	return -1;
+}
+
+static void
+lapic_reset(struct cpu *c)
+{
+	struct lapic *a = &c->apic;
+	int i;
+
+	memset(a, 0, sizeof(*a));
+	a->dfr = 0xFFFFFFFF;
+	a->svr = 0xFF;
+	for (i = 0; i < 6; i++)
+		a->lvt[i] = LVT_MASKED;
+	a->base_msr = LAPIC_BASE | 0x800 | (c->id == 0 ? 0x100 : 0);
+}
+
+/* The vector this CPU's APIC would deliver now, or -1. */
+static int
+lapic_pending(const struct cpu *c)
+{
+	const struct lapic *a = &c->apic;
+	const int irr = bits_highest(a->irr), isr = bits_highest(a->isr);
+	int ppr = (int)(a->tpr & 0xF0);
+
+	if ((a->svr & 0x100) == 0 || irr < 0)
+		return -1;
+	if (isr >= 0 && (isr & 0xF0) > ppr)
+		ppr = isr & 0xF0;
+	return ((irr & 0xF0) > ppr) ? irr : -1;
+}
+
+static void
+lapic_set_irq(struct cpu *c, uint8_t vector, bool level)
+{
+	struct lapic *a = &c->apic;
+
+	if (vector < 16)
+		return;
+	a->irr[vector / 32] |= 1u << (vector % 32);
+	if (level)
+		a->tmr[vector / 32] |= 1u << (vector % 32);
+	else
+		a->tmr[vector / 32] &= ~(1u << (vector % 32));
+	cpu_wake(c);
+}
+
+/* Does an interrupt addressed like this go to CPU c? */
+static bool
+lapic_match(const struct cpu *c, uint8_t dest, bool logical)
+{
+	if (!logical)
+		return dest == 0xFF || dest == c->id;
+	if (dest == 0xFF)
+		return true;
+	if ((c->apic.dfr >> 28) == 0xF)			/* flat */
+		return ((c->apic.ldr >> 24) & dest) != 0;
+	return (c->apic.ldr >> 24) == dest;		/* cluster: exact */
+}
+
+/*
+ * Deliver one interrupt message, from the I/O APIC or from a CPU's
+ * interrupt command register. 'self' is the sending CPU, or NULL.
+ * shorthand: 0 use dest, 1 self, 2 all, 3 all but self.
+ */
+static void
+apic_deliver(struct cpu *self, uint8_t dest, bool logical, unsigned int mode,
+    uint8_t vector, bool level, unsigned int shorthand)
+{
+	unsigned int i;
+
+	for (i = 0; i < ncpus; i++) {
+		struct cpu *c = &cpus[i];
+
+		if (shorthand == 1 && c != self)
+			continue;
+		if (shorthand == 3 && c == self)
+			continue;
+		if (shorthand == 0 && !lapic_match(c, dest, logical))
+			continue;
+
+		switch (mode) {
+		case 0:				/* fixed */
+			lapic_set_irq(c, vector, level);
+			break;
+		case 1:				/* lowest priority: the first */
+			lapic_set_irq(c, vector, level);
+			return;
+		case 4:				/* NMI */
+			c->nmi_pending = true;
+			cpu_wake(c);
+			break;
+		case 5:				/* INIT: back to waiting */
+			if (c != self && c->id != 0) {
+				c->wait_sipi = true;
+				c->sipi_pending = false;
+				cpu_wake(c);
+			}
+			break;
+		case 6:				/* startup */
+			if (c->wait_sipi) {
+				c->sipi_vector = vector;
+				c->sipi_pending = true;
+				cpu_wake(c);
+			}
+			break;
+		}
+	}
+}
+
+static void
+ioapic_eoi(uint8_t vector)
+{
+	unsigned int i;
+
+	for (i = 0; i < IOAPIC_PINS; i++) {
+		if ((ioapic.rte[i] & 0xFF) == vector)
+			ioapic.rte[i] &= ~(1ULL << 14);	/* remote IRR */
+	}
+}
+
+/* Is the last timer tick still waiting for the guest to take it? */
+static bool
+timer_irq_waiting(void)
+{
+	const uint64_t rte = ioapic.rte[2];
+	const unsigned int vec = (unsigned int)rte & 0xFF;
+	unsigned int i;
+
+	if (apic_mode && (rte & (1ULL << 16)) == 0) {
+		for (i = 0; i < ncpus; i++) {
+			if (cpus[i].apic.irr[vec / 32] & (1u << (vec % 32)))
+				return true;
+		}
+		return false;
+	}
+	return (pics[0].irr & 1) != 0 && (pics[0].imr & 1) == 0;
+}
+
+/* An ISA line was raised. The timer's line 0 arrives on pin 2. */
+static void
+ioapic_set_irq(int line)
+{
+	const unsigned int pin = (line == 0) ? 2 : (unsigned int)line;
+	uint64_t rte;
+	bool level;
+
+	if (pin >= IOAPIC_PINS)
+		return;
+	rte = ioapic.rte[pin];
+	if (rte & (1ULL << 16))				/* masked */
+		return;
+	level = (rte & (1ULL << 15)) != 0;
+	if (level) {
+		if (rte & (1ULL << 14))
+			return;		/* still being serviced */
+		ioapic.rte[pin] |= 1ULL << 14;
+	}
+	apic_deliver(NULL, (uint8_t)(rte >> 56), (rte & (1ULL << 11)) != 0,
+	    (unsigned int)(rte >> 8) & 7, (uint8_t)rte, level, 0);
+}
+
+static uint32_t
+ioapic_read(uint64_t off)
+{
+	const uint32_t r = ioapic.regsel;
+
+	if (off == 0x00)
+		return r;
+	if (off != 0x10)
+		return 0;
+	if (r == 0)
+		return ioapic.id << 24;
+	if (r == 1)
+		return ((IOAPIC_PINS - 1) << 16) | 0x20;	/* version */
+	if (r >= 0x10 && r < 0x10 + 2 * IOAPIC_PINS) {
+		const uint64_t rte = ioapic.rte[(r - 0x10) / 2];
+
+		return (uint32_t)((r & 1) ? rte >> 32 : rte);
+	}
+	return 0;
+}
+
+static void
+ioapic_write(uint64_t off, uint32_t v)
+{
+	const uint32_t r = ioapic.regsel;
+
+	if (off == 0x00) {
+		ioapic.regsel = v & 0xFF;
+	} else if (off == 0x40) {
+		ioapic_eoi((uint8_t)v);
+	} else if (off == 0x10) {
+		if (r == 0) {
+			ioapic.id = (v >> 24) & 0xF;
+		} else if (r >= 0x10 && r < 0x10 + 2 * IOAPIC_PINS) {
+			uint64_t *rte = &ioapic.rte[(r - 0x10) / 2];
+
+			if (r & 1) {
+				*rte = (*rte & 0xFFFFFFFFULL) | ((uint64_t)v << 32);
+			} else {
+				/* Delivery status and remote IRR are ours. */
+				*rte = (*rte & 0xFFFFFFFF00005000ULL) |
+				    (v & ~0x5000u);
+			}
+		}
+	}
+}
+
+static unsigned int
+lapic_divisor(const struct lapic *a)
+{
+	const unsigned int v = (a->divide & 3) | ((a->divide >> 1) & 4);
+
+	return (v == 7) ? 1 : 2u << v;
+}
+
+static void
+lapic_timer_start(struct lapic *a)
+{
+	if (a->init_count == 0)
+		a->deadline_ns = 0;
+	else
+		a->deadline_ns = now_ns() +
+		    (uint64_t)a->init_count * lapic_divisor(a);
+}
+
+/* Fire this CPU's timer if it is due. */
+static void
+lapic_timer_poll(struct cpu *c, uint64_t now)
+{
+	struct lapic *a = &c->apic;
+
+	const uint8_t vec = (uint8_t)a->lvt[LVT_TIMER];
+
+	if (a->deadline_ns == 0 || now < a->deadline_ns)
+		return;
+	if (a->lvt[LVT_TIMER] & LVT_PERIODIC) {
+		const uint64_t per = (uint64_t)a->init_count * lapic_divisor(a);
+
+		/*
+		 * One period per call, held back while the last tick is
+		 * still waiting, and with a few periods of debt at most:
+		 * as for the 8254 and for the same reasons. The kernel
+		 * checks each of these timers against the other by counting
+		 * interrupts.
+		 */
+		if ((a->lvt[LVT_TIMER] & LVT_MASKED) == 0) {
+			if (a->irr[vec / 32] & (1u << (vec % 32)))
+				return;
+			lapic_set_irq(c, vec, false);
+		}
+		a->deadline_ns += per;
+		if (now > a->deadline_ns + 4 * per)
+			a->deadline_ns = now + per;
+	} else {
+		if ((a->lvt[LVT_TIMER] & LVT_MASKED) == 0)
+			lapic_set_irq(c, vec, false);
+		a->deadline_ns = 0;
+	}
+}
+
+static uint32_t
+lapic_read(struct cpu *c, uint64_t off)
+{
+	struct lapic *a = &c->apic;
+	uint64_t now, per;
+
+	if (off >= 0x100 && off < 0x180)
+		return a->isr[(off - 0x100) / 16];
+	if (off >= 0x180 && off < 0x200)
+		return a->tmr[(off - 0x180) / 16];
+	if (off >= 0x200 && off < 0x280)
+		return a->irr[(off - 0x200) / 16];
+	if (off >= 0x320 && off <= 0x370)
+		return a->lvt[(off - 0x320) / 16];
+
+	switch (off) {
+	case 0x020: return c->id << 24;
+	case 0x030: return 0x00050014;		/* version, six LVT entries */
+	case 0x080: return a->tpr;
+	case 0x0A0: {
+		const int isr = bits_highest(a->isr);
+		uint32_t ppr = a->tpr & 0xF0;
+
+		if (isr >= 0 && (uint32_t)(isr & 0xF0) > ppr)
+			ppr = (uint32_t)isr & 0xF0;
+		return ppr;
+	}
+	case 0x0D0: return a->ldr;
+	case 0x0E0: return a->dfr;
+	case 0x0F0: return a->svr;
+	case 0x280: return a->esr;
+	case 0x300: return a->icr_lo;
+	case 0x310: return a->icr_hi;
+	case 0x380: return a->init_count;
+	case 0x390:
+		if (a->init_count == 0)
+			return 0;
+		now = now_ns();
+		per = (uint64_t)a->init_count * lapic_divisor(a);
+		if (a->deadline_ns == 0)
+			return 0;
+		if (now >= a->deadline_ns)
+			return (a->lvt[LVT_TIMER] & LVT_PERIODIC) ?
+			    a->init_count : 0;
+		(void)per;
+		return (uint32_t)((a->deadline_ns - now) / lapic_divisor(a));
+	case 0x3E0: return a->divide;
+	default:    return 0;
+	}
+}
+
+static void
+lapic_write(struct cpu *c, uint64_t off, uint32_t v)
+{
+	struct lapic *a = &c->apic;
+	int vec;
+
+	if (off >= 0x320 && off <= 0x370) {
+		a->lvt[(off - 0x320) / 16] = v;
+		return;
+	}
+	switch (off) {
+	case 0x080: a->tpr = v & 0xFF; break;
+	case 0x0B0:				/* end of interrupt */
+		vec = bits_highest(a->isr);
+		if (vec >= 0) {
+			a->isr[vec / 32] &= ~(1u << (vec % 32));
+			if (a->tmr[vec / 32] & (1u << (vec % 32)))
+				ioapic_eoi((uint8_t)vec);
+		}
+		break;
+	case 0x0D0: a->ldr = v & 0xFF000000; break;
+	case 0x0E0: a->dfr = v | 0x0FFFFFFF; break;
+	case 0x0F0: a->svr = v & 0x1FF; break;
+	case 0x280: a->esr = 0; break;
+	case 0x310: a->icr_hi = v; break;
+	case 0x300:
+		a->icr_lo = v & ~(1u << 12);	/* never left pending */
+		/* An INIT "de-assert" is a leftover of older APICs. */
+		if (((v >> 8) & 7) == 5 && (v & (1u << 14)) == 0)
+			break;
+		apic_deliver(c, (uint8_t)(a->icr_hi >> 24),
+		    (v & (1u << 11)) != 0, (v >> 8) & 7, (uint8_t)v, false,
+		    (v >> 18) & 3);
+		break;
+	case 0x380:
+		a->init_count = v;
+		lapic_timer_start(a);
+		break;
+	case 0x3E0: a->divide = v & 0xB; break;
+	}
+}
+
+/*
+ * The MP table: how a kernel with no ACPI learns of the CPUs, the I/O APIC
+ * and which pin each ISA interrupt arrives on. It goes where the BIOS would
+ * have put it.
+ */
+#define MPFP_GPA	0x000F0000ULL
+#define MPTABLE_GPA	0x000F0100ULL
+
+static uint8_t
+sum8(const uint8_t *p, size_t n)
+{
+	uint8_t s = 0;
+
+	while (n-- > 0)
+		s += *p++;
+	return s;
+}
+
+static void
+mptable_build(void)
+{
+	uint8_t *fp = ram + MPFP_GPA, *t = ram + MPTABLE_GPA, *e;
+	const uint8_t ioapic_id = (uint8_t)ncpus;
+	uint16_t count = 0;
+	unsigned int i;
+
+	memset(t, 0, 0x1000);
+	memcpy(t, "PCMP", 4);
+	t[6] = 4;					/* spec 1.4 */
+	memcpy(t + 8, "NVMM    ", 8);
+	memcpy(t + 16, "NVMM-RUN    ", 12);
+	*(uint32_t *)(void *)(t + 36) = (uint32_t)LAPIC_BASE;
+	e = t + 44;
+
+	for (i = 0; i < ncpus; i++) {			/* processors */
+		e[0] = 0;
+		e[1] = (uint8_t)i;
+		e[2] = 0x14;
+		e[3] = (uint8_t)(1 | (i == 0 ? 2 : 0));	/* usable, boot */
+		*(uint32_t *)(void *)(e + 4) = 0x00800F00;
+		*(uint32_t *)(void *)(e + 8) = 0x00000201;	/* FPU, APIC */
+		e += 20;
+		count++;
+	}
+	e[0] = 1;					/* the ISA bus */
+	e[1] = 0;
+	memcpy(e + 2, "ISA   ", 6);
+	e += 8;
+	count++;
+
+	e[0] = 2;					/* the I/O APIC */
+	e[1] = ioapic_id;
+	e[2] = 0x20;
+	e[3] = 1;
+	*(uint32_t *)(void *)(e + 4) = (uint32_t)IOAPIC_BASE;
+	e += 8;
+	count++;
+
+	for (i = 0; i < 16; i++) {			/* ISA lines to pins */
+		if (i == 2)
+			continue;			/* the cascade */
+		e[0] = 3;
+		e[1] = 0;				/* a vectored interrupt */
+		e[4] = 0;				/* from bus 0 */
+		e[5] = (uint8_t)i;
+		e[6] = ioapic_id;
+		e[7] = (uint8_t)(i == 0 ? 2 : i);
+		e += 8;
+		count++;
+	}
+	e[0] = 4; e[1] = 3; e[4] = 0; e[5] = 0; e[6] = 0xFF; e[7] = 0;
+	e += 8;						/* ExtINT on LINT0 */
+	count++;
+	e[0] = 4; e[1] = 1; e[4] = 0; e[5] = 0; e[6] = 0xFF; e[7] = 1;
+	e += 8;						/* NMI on LINT1 */
+	count++;
+
+	*(uint16_t *)(void *)(t + 4) = (uint16_t)(e - t);
+	*(uint16_t *)(void *)(t + 34) = count;
+	t[7] = (uint8_t)-sum8(t, (size_t)(e - t));
+
+	memset(fp, 0, 16);
+	memcpy(fp, "_MP_", 4);
+	*(uint32_t *)(void *)(fp + 4) = (uint32_t)MPTABLE_GPA;
+	fp[8] = 1;					/* 16 bytes */
+	fp[9] = 4;
+	fp[10] = (uint8_t)-sum8(fp, 16);
+
+	ioapic.id = ioapic_id;
+	for (i = 0; i < IOAPIC_PINS; i++)
+		ioapic.rte[i] = 1ULL << 16;		/* masked */
+}
+
+/* -------------------------------------------------------------------------- */
 /* I/O ports. */
 
 static void
@@ -1402,7 +1951,32 @@ static void
 mem_callback(struct nvmm_mem *mem)
 {
 	const uint64_t idx = (mem->gpa - VIRTIO_BASE) / VIRTIO_STRIDE;
+	struct cpu *c = (struct cpu *)(void *)((char *)mem->vcpu -
+	    offsetof(struct cpu, vcpu));
 	uint32_t v = 0;
+
+	if (apic_mode && mem->size == 4 &&
+	    (mem->gpa & ~0xFFFULL) == LAPIC_BASE) {
+		if (mem->write) {
+			memcpy(&v, mem->data, 4);
+			lapic_write(c, mem->gpa & 0xFFF, v);
+		} else {
+			v = lapic_read(c, mem->gpa & 0xFFF);
+			memcpy(mem->data, &v, 4);
+		}
+		return;
+	}
+	if (apic_mode && mem->size == 4 &&
+	    (mem->gpa & ~0xFFFULL) == IOAPIC_BASE) {
+		if (mem->write) {
+			memcpy(&v, mem->data, 4);
+			ioapic_write(mem->gpa & 0xFFF, v);
+		} else {
+			v = ioapic_read(mem->gpa & 0xFFF);
+			memcpy(mem->data, &v, 4);
+		}
+		return;
+	}
 
 	if (mem->gpa >= VIRTIO_BASE && idx < nvdevs && mem->size <= 4) {
 		const uint64_t off = (mem->gpa - VIRTIO_BASE) % VIRTIO_STRIDE;
@@ -1524,9 +2098,9 @@ load_linux(const char *kpath, const char *ipath, const char *cmdline)
 
 /* Long mode with the first 4G mapped one to one, as the protocol asks. */
 static void
-setup_cpu(uint64_t entry)
+setup_cpu(struct cpu *c, uint64_t entry)
 {
-	struct nvmm_x64_state *st = vcpu.state;
+	struct nvmm_x64_state *st = c->vcpu.state;
 	uint64_t *pml4 = (uint64_t *)(void *)(ram + PML4_GPA);
 	uint64_t *pdpt = pml4 + 512;
 	uint64_t *pd = pdpt + 512;
@@ -1546,7 +2120,7 @@ setup_cpu(uint64_t entry)
 	gdt[2] = 0x00AF9B000000FFFFULL;		/* 0x10: 64-bit code */
 	gdt[3] = 0x00CF93000000FFFFULL;		/* 0x18: data */
 
-	if (nvmm_vcpu_getstate(&mach, &vcpu, NVMM_X64_STATE_ALL) == -1)
+	if (nvmm_vcpu_getstate(&mach, &c->vcpu, NVMM_X64_STATE_ALL) == -1)
 		die("getstate: %s", strerror(errno));
 
 	memset(&seg, 0, sizeof(seg));
@@ -1590,7 +2164,7 @@ setup_cpu(uint64_t entry)
 	st->gprs[NVMM_X64_GPR_RSI] = BOOT_PARAMS_GPA;
 	st->gprs[NVMM_X64_GPR_RFLAGS] = 0x2;
 
-	if (nvmm_vcpu_setstate(&mach, &vcpu, NVMM_X64_STATE_SEGS |
+	if (nvmm_vcpu_setstate(&mach, &c->vcpu, NVMM_X64_STATE_SEGS |
 	    NVMM_X64_STATE_GPRS | NVMM_X64_STATE_CRS |
 	    NVMM_X64_STATE_MSRS) == -1)
 		die("setstate: %s", strerror(errno));
@@ -1606,40 +2180,70 @@ kick_handler(int sig)
 }
 
 /*
- * The vCPU only returns from the kernel when the guest needs something or
- * the host interrupts it. A guest that is busy computing does neither often
- * enough for a 1 kHz timer, so poke the vCPU thread at that rate: the signal
- * interrupts the CPU it is on, which is all it takes.
+ * Something happened that CPU c should look at. If it is asleep, wake it;
+ * if it is in the guest, interrupt the host CPU it is on, which brings it
+ * back out. Called with 'big' held.
+ */
+static void
+cpu_wake(struct cpu *c)
+{
+	if (c->in_guest)
+		pthread_kill(c->thread, SIGUSR1);
+	pthread_cond_signal(&c->cond);
+}
+
+/*
+ * The clock: once a millisecond, fire whatever timers are due, pass on what
+ * was typed, and bring every running CPU back out of the guest. A guest
+ * that is busy computing would otherwise not come back often enough to be
+ * handed its timer interrupts, or one raised just as it was going in.
  */
 static void *
-kicker(void *arg)
+ticker(void *arg)
 {
+	unsigned int i;
+	uint64_t now;
+
 	(void)arg;
 	while (running) {
 		usleep(1000);
-		pthread_kill(vcpu_thread, SIGUSR1);
+		pthread_mutex_lock(&big);
+		console_poll();
+		(void)pit_poll();
+		now = now_ns();
+		for (i = 0; i < ncpus; i++) {
+			if (apic_mode)
+				lapic_timer_poll(&cpus[i], now);
+			if (cpus[i].in_guest)
+				pthread_kill(cpus[i].thread, SIGUSR1);
+		}
+		if (!running) {
+			for (i = 0; i < ncpus; i++)
+				pthread_cond_signal(&cpus[i].cond);
+		}
+		pthread_mutex_unlock(&big);
 	}
 	return NULL;
 }
 
 static void
-set_gpr(int reg, uint64_t val)
+set_gpr(struct cpu *c, int reg, uint64_t val)
 {
-	if (nvmm_vcpu_getstate(&mach, &vcpu, NVMM_X64_STATE_GPRS) == -1)
+	if (nvmm_vcpu_getstate(&mach, &c->vcpu, NVMM_X64_STATE_GPRS) == -1)
 		die("getstate: %s", strerror(errno));
-	vcpu.state->gprs[reg] = val;
-	if (nvmm_vcpu_setstate(&mach, &vcpu, NVMM_X64_STATE_GPRS) == -1)
+	c->vcpu.state->gprs[reg] = val;
+	if (nvmm_vcpu_setstate(&mach, &c->vcpu, NVMM_X64_STATE_GPRS) == -1)
 		die("setstate: %s", strerror(errno));
 }
 
 static void
-dump_and_die(const char *why)
+dump_and_die(struct cpu *c, const char *why)
 {
-	const struct nvmm_x64_state *st = vcpu.state;
+	const struct nvmm_x64_state *st = c->vcpu.state;
 
-	(void)nvmm_vcpu_getstate(&mach, &vcpu, NVMM_X64_STATE_ALL);
-	die("%s: rip %#llx rsp %#llx cr0 %#llx cr2 %#llx cr3 %#llx cr4 %#llx "
-	    "efer %#llx", why,
+	(void)nvmm_vcpu_getstate(&mach, &c->vcpu, NVMM_X64_STATE_ALL);
+	die("cpu %u: %s: rip %#llx rsp %#llx cr0 %#llx cr2 %#llx cr3 %#llx "
+	    "cr4 %#llx efer %#llx", c->id, why,
 	    (unsigned long long)st->gprs[NVMM_X64_GPR_RIP],
 	    (unsigned long long)st->gprs[NVMM_X64_GPR_RSP],
 	    (unsigned long long)st->crs[NVMM_X64_CR_CR0],
@@ -1649,142 +2253,274 @@ dump_and_die(const char *why)
 	    (unsigned long long)st->msrs[NVMM_X64_MSR_EFER]);
 }
 
+/*
+ * Do the 8259s have an interrupt for this CPU? They only ever interrupt the
+ * first one, and once it has a local APIC, only while that lets them
+ * through: before it is enabled, or with LINT0 set to pass them on.
+ */
+static bool
+pic_wants(const struct cpu *c)
+{
+	const struct lapic *a = &c->apic;
+
+	if (c->id != 0 || !pic_pending())
+		return false;
+	if (!apic_mode || (a->svr & 0x100) == 0)
+		return true;
+	return (a->lvt[LVT_LINT0] & LVT_MASKED) == 0 &&
+	    ((a->lvt[LVT_LINT0] >> 8) & 7) == 7;		/* ExtINT */
+}
+
+static bool
+cpu_has_interrupt(const struct cpu *c)
+{
+	return c->nmi_pending || pic_wants(c) ||
+	    (apic_mode && lapic_pending(c) >= 0);
+}
+
 /* Hand the guest its next interrupt, or ask to be told when it can take it. */
 static void
-deliver_interrupts(void)
+deliver_interrupts(struct cpu *c)
 {
-	const struct nvmm_vcpu_exit *exit = vcpu.exit;
+	const struct nvmm_vcpu_exit *exit = c->vcpu.exit;
+	int vec;
 
-	if (!pic_pending())
+	if (c->nmi_pending && !exit->exitstate.evt_pending) {
+		c->nmi_pending = false;
+		c->vcpu.event->type = NVMM_VCPU_EVENT_EXCP;
+		c->vcpu.event->vector = 2;
+		c->vcpu.event->u.excp.error = 0;
+		if (nvmm_vcpu_inject(&mach, &c->vcpu) == -1)
+			die("inject: %s", strerror(errno));
+		return;
+	}
+	if (!cpu_has_interrupt(c))
 		return;
 
 	if ((exit->exitstate.rflags & 0x200) && !exit->exitstate.int_shadow &&
 	    !exit->exitstate.evt_pending) {
-		vcpu.event->type = NVMM_VCPU_EVENT_INTR;
-		vcpu.event->vector = pic_ack();
-		if (nvmm_vcpu_inject(&mach, &vcpu) == -1)
+		if (apic_mode && (vec = lapic_pending(c)) >= 0) {
+			/* Taken: from requested to in service. */
+			c->apic.irr[vec / 32] &= ~(1u << (vec % 32));
+			c->apic.isr[vec / 32] |= 1u << (vec % 32);
+		} else if (pic_wants(c)) {
+			vec = pic_ack();
+		} else {
+			return;
+		}
+		c->vcpu.event->type = NVMM_VCPU_EVENT_INTR;
+		c->vcpu.event->vector = (uint8_t)vec;
+		if (nvmm_vcpu_inject(&mach, &c->vcpu) == -1)
 			die("inject: %s", strerror(errno));
 		return;
 	}
 
 	if (!exit->exitstate.int_window_exiting) {
-		if (nvmm_vcpu_getstate(&mach, &vcpu, NVMM_X64_STATE_INTR) == -1)
+		if (nvmm_vcpu_getstate(&mach, &c->vcpu,
+		    NVMM_X64_STATE_INTR) == -1)
 			die("getstate: %s", strerror(errno));
-		vcpu.state->intr.int_window_exiting = 1;
-		if (nvmm_vcpu_setstate(&mach, &vcpu, NVMM_X64_STATE_INTR) == -1)
+		c->vcpu.state->intr.int_window_exiting = 1;
+		if (nvmm_vcpu_setstate(&mach, &c->vcpu,
+		    NVMM_X64_STATE_INTR) == -1)
 			die("setstate: %s", strerror(errno));
 	}
 }
 
-/* The guest is idle: wait for the timer or the keyboard. */
+/* Sleep, with 'big' released, until woken or a millisecond-scale timeout. */
 static void
-idle(void)
+cpu_sleep(struct cpu *c)
 {
-	struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-	uint64_t ns;
+	struct timespec ts;
+	struct timeval tv;
 
-	for (;;) {
-		console_poll();
-		ns = pit_poll();
-		if (net_rx_ready)
-			net_rx(netdev);
-		if (pic_pending() || !running)
-			return;
-		if ((vcpu.exit->exitstate.rflags & 0x200) == 0) {
-			/* Halted with interrupts off: nothing can wake it. */
+	gettimeofday(&tv, NULL);
+	ts.tv_sec = tv.tv_sec;
+	ts.tv_nsec = (tv.tv_usec + 20000) * 1000;	/* 20 ms */
+	if (ts.tv_nsec >= 1000000000) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000;
+	}
+	(void)pthread_cond_timedwait(&c->cond, &big, &ts);
+}
+
+/* The guest executed HLT: wait for something to interrupt it. */
+static void
+cpu_idle(struct cpu *c)
+{
+	unsigned int i, stopped = 0;
+
+	if ((c->vcpu.exit->exitstate.rflags & 0x200) == 0 && !c->nmi_pending) {
+		/*
+		 * Halted with interrupts off: this CPU is finished. When
+		 * they all are, so is the machine.
+		 */
+		c->stopped = true;
+		for (i = 0; i < ncpus; i++)
+			stopped += cpus[i].stopped || cpus[i].wait_sipi;
+		if (stopped == ncpus) {
 			fprintf(stderr, "\r\nnvmm-run: the guest halted\r\n");
 			running = false;
-			return;
 		}
-		if (ns == 0 || ns > 50000000)
-			ns = 50000000;
-		(void)poll(&pfd, 1, (int)(ns / 1000000) + 1);
 	}
+	while (running && !cpu_has_interrupt(c) && !c->wait_sipi)
+		cpu_sleep(c);
+	c->stopped = false;
+}
+
+/* An AP is started: real mode, at the address the startup IPI names. */
+static void
+cpu_startup(struct cpu *c)
+{
+	struct nvmm_x64_state *st = c->vcpu.state;
+	struct nvmm_x64_state_seg seg;
+
+	if (nvmm_vcpu_getstate(&mach, &c->vcpu, NVMM_X64_STATE_ALL) == -1)
+		die("getstate: %s", strerror(errno));
+
+	memset(&seg, 0, sizeof(seg));
+	seg.attrib.type = 0x3;
+	seg.attrib.s = 1;
+	seg.attrib.p = 1;
+	seg.limit = 0xFFFF;
+	st->segs[NVMM_X64_SEG_DS] = seg;
+	st->segs[NVMM_X64_SEG_ES] = seg;
+	st->segs[NVMM_X64_SEG_SS] = seg;
+	st->segs[NVMM_X64_SEG_FS] = seg;
+	st->segs[NVMM_X64_SEG_GS] = seg;
+	seg.attrib.type = 0xB;
+	seg.selector = (uint16_t)(c->sipi_vector << 8);
+	seg.base = (uint64_t)c->sipi_vector << 12;
+	st->segs[NVMM_X64_SEG_CS] = seg;
+	st->segs[NVMM_X64_SEG_GDT].base = 0;
+	st->segs[NVMM_X64_SEG_GDT].limit = 0xFFFF;
+	st->segs[NVMM_X64_SEG_IDT].base = 0;
+	st->segs[NVMM_X64_SEG_IDT].limit = 0xFFFF;
+
+	memset(st->gprs, 0, sizeof(st->gprs));
+	st->gprs[NVMM_X64_GPR_RFLAGS] = 0x2;
+	st->gprs[NVMM_X64_GPR_RDX] = 0x00800F00;
+	st->crs[NVMM_X64_CR_CR0] = 0x60000010;
+	st->crs[NVMM_X64_CR_CR2] = 0;
+	st->crs[NVMM_X64_CR_CR3] = 0;
+	st->crs[NVMM_X64_CR_CR4] = 0;
+	st->msrs[NVMM_X64_MSR_EFER] = 0;
+	memset(&st->intr, 0, sizeof(st->intr));
+
+	if (nvmm_vcpu_setstate(&mach, &c->vcpu, NVMM_X64_STATE_SEGS |
+	    NVMM_X64_STATE_GPRS | NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS |
+	    NVMM_X64_STATE_INTR) == -1)
+		die("setstate: %s", strerror(errno));
+	memset(&c->vcpu.exit->exitstate, 0, sizeof(c->vcpu.exit->exitstate));
+	lapic_reset(c);
 }
 
 static void
-run(void)
+handle_rdmsr(struct cpu *c)
 {
-	struct nvmm_vcpu_exit *exit = vcpu.exit;
-	unsigned long nexits = 0;
+	const struct nvmm_vcpu_exit *exit = c->vcpu.exit;
+	uint64_t val = 0;
 
+	if (exit->u.rdmsr.msr == 0x1B && apic_mode)	/* APIC base */
+		val = c->apic.base_msr;
+	else if (verbose)
+		fprintf(stderr, "[cpu %u rdmsr %#x]\r\n", c->id,
+		    exit->u.rdmsr.msr);
+
+	(void)nvmm_vcpu_getstate(&mach, &c->vcpu, NVMM_X64_STATE_GPRS);
+	c->vcpu.state->gprs[NVMM_X64_GPR_RAX] = (uint32_t)val;
+	c->vcpu.state->gprs[NVMM_X64_GPR_RDX] = val >> 32;
+	c->vcpu.state->gprs[NVMM_X64_GPR_RIP] = exit->u.rdmsr.npc;
+	(void)nvmm_vcpu_setstate(&mach, &c->vcpu, NVMM_X64_STATE_GPRS);
+}
+
+static void *
+cpu_thread(void *arg)
+{
+	struct cpu *c = arg;
+	struct nvmm_vcpu_exit *exit = c->vcpu.exit;
+
+	c->thread = pthread_self();
+	pthread_mutex_lock(&big);
 	/* Before the first run there is no exit state: interrupts are off. */
 	memset(&exit->exitstate, 0, sizeof(exit->exitstate));
 
 	while (running) {
-		console_poll();
-		(void)pit_poll();
-		if (net_rx_ready)
-			net_rx(netdev);
-		deliver_interrupts();
-
-		if (nvmm_vcpu_run(&mach, &vcpu) == -1) {
-			if (errno == EINTR)
+		if (c->wait_sipi) {
+			if (!c->sipi_pending) {
+				cpu_sleep(c);
 				continue;
-			die("vcpu run: %s", strerror(errno));
+			}
+			c->sipi_pending = false;
+			c->wait_sipi = false;
+			cpu_startup(c);
 		}
-		nexits++;
+		if (c->id == 0)
+			(void)pit_poll();
+		if (apic_mode)
+			lapic_timer_poll(c, now_ns());
+		deliver_interrupts(c);
+
+		c->in_guest = true;
+		pthread_mutex_unlock(&big);
+		if (nvmm_vcpu_run(&mach, &c->vcpu) == -1 && errno != EINTR)
+			die("cpu %u: vcpu run: %s", c->id, strerror(errno));
+		pthread_mutex_lock(&big);
+		c->in_guest = false;
+		c->nruns++;
 
 		switch (exit->reason) {
 		case NVMM_VCPU_EXIT_NONE:
 		case NVMM_VCPU_EXIT_INT_READY:
 			break;
 		case NVMM_VCPU_EXIT_IO:
-			if (nvmm_assist_io(&mach, &vcpu) == -1)
-				dump_and_die("I/O emulation failed");
+			if (nvmm_assist_io(&mach, &c->vcpu) == -1)
+				dump_and_die(c, "I/O emulation failed");
 			break;
 		case NVMM_VCPU_EXIT_MEMORY:
-			if (nvmm_assist_mem(&mach, &vcpu) == -1)
-				dump_and_die("memory access emulation failed");
+			if (nvmm_assist_mem(&mach, &c->vcpu) == -1)
+				dump_and_die(c, "memory access emulation failed");
 			break;
 		case NVMM_VCPU_EXIT_HALTED:
-			idle();
+			cpu_idle(c);
 			break;
 		case NVMM_VCPU_EXIT_RDMSR:
-			if (verbose)
-				fprintf(stderr, "[rdmsr %#x]\r\n",
-				    exit->u.rdmsr.msr);
-			(void)nvmm_vcpu_getstate(&mach, &vcpu,
-			    NVMM_X64_STATE_GPRS);
-			vcpu.state->gprs[NVMM_X64_GPR_RAX] = 0;
-			vcpu.state->gprs[NVMM_X64_GPR_RDX] = 0;
-			vcpu.state->gprs[NVMM_X64_GPR_RIP] = exit->u.rdmsr.npc;
-			(void)nvmm_vcpu_setstate(&mach, &vcpu,
-			    NVMM_X64_STATE_GPRS);
+			handle_rdmsr(c);
 			break;
 		case NVMM_VCPU_EXIT_WRMSR:
-			if (verbose)
-				fprintf(stderr, "[wrmsr %#x = %#llx]\r\n",
-				    exit->u.wrmsr.msr,
+			if (exit->u.wrmsr.msr == 0x1B && apic_mode)
+				c->apic.base_msr = exit->u.wrmsr.val;
+			else if (verbose)
+				fprintf(stderr, "[cpu %u wrmsr %#x = %#llx]\r\n",
+				    c->id, exit->u.wrmsr.msr,
 				    (unsigned long long)exit->u.wrmsr.val);
-			set_gpr(NVMM_X64_GPR_RIP, exit->u.wrmsr.npc);
+			set_gpr(c, NVMM_X64_GPR_RIP, exit->u.wrmsr.npc);
 			break;
 		case NVMM_VCPU_EXIT_MONITOR:
 		case NVMM_VCPU_EXIT_MWAIT:
-			set_gpr(NVMM_X64_GPR_RIP, exit->u.insn.npc);
+			set_gpr(c, NVMM_X64_GPR_RIP, exit->u.insn.npc);
 			break;
 		case NVMM_VCPU_EXIT_SHUTDOWN:
-			dump_and_die("the guest triple-faulted");
+			dump_and_die(c, "the guest triple-faulted");
 			break;
 		default:
-			fprintf(stderr, "\r\nnvmm-run: exit reason %#llx "
-			    "(hw %#llx)\r\n",
+			fprintf(stderr, "\r\nnvmm-run: cpu %u: exit reason "
+			    "%#llx (hw %#llx)\r\n", c->id,
 			    (unsigned long long)exit->reason,
 			    (unsigned long long)exit->u.inv.hwcode);
-			dump_and_die("unexpected exit");
+			dump_and_die(c, "unexpected exit");
 		}
 	}
 
-	if (verbose)
-		fprintf(stderr, "\r\n[%lu returns from the kernel]\r\n", nexits);
+	pthread_mutex_unlock(&big);
+	return NULL;
 }
 
 static void
 usage(void)
 {
 	fprintf(stderr, "usage: nvmm-run -k vmlinuz [-i initramfs] "
-	    "[-d disk.img] [-n vmnet|socket] [-m megabytes]\n"
-	    "                [-a \"extra cmdline\"] [-v]\n");
+	    "[-d disk.img] [-n vmnet|socket] [-c cpus]\n"
+	    "                [-m megabytes] [-a \"extra cmdline\"] [-v]\n");
 	exit(2);
 }
 
@@ -1799,45 +2535,64 @@ main(int argc, char **argv)
 	char cmdline[CMDLINE_MAX];
 	uint64_t tsc_hz = 0, entry;
 	size_t len = sizeof(tsc_hz);
-	pthread_t kick;
-	long mb = 512;
+	pthread_t tick, threads[MAX_CPUS];
+	unsigned int i;
+	long mb = 512, n = 1;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:d:n:m:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:n:c:m:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
 		case 'd': dpath = optarg; break;
 		case 'n': net = optarg; break;
+		case 'c': n = atol(optarg); break;
 		case 'm': mb = atol(optarg); break;
 		case 'a': extra = optarg; break;
 		case 'v': verbose = true; break;
 		default: usage();
 		}
 	}
-	if (kpath == NULL || mb < 64 || mb > MEM_MAX_MB)
+	if (kpath == NULL || mb < 64 || mb > MEM_MAX_MB || n < 1 ||
+	    n > MAX_CPUS)
 		usage();
 	ram_size = (uint64_t)mb << 20;
+	ncpus = (unsigned int)n;
+	apic_mode = ncpus > 1;
 
 	if (nvmm_init() == -1)
 		die("cannot open /dev/nvmm: %s", strerror(errno));
 	if (nvmm_machine_create(&mach) == -1)
 		die("machine create: %s", strerror(errno));
-	if (nvmm_vcpu_create(&mach, 0, &vcpu) == -1)
-		die("vcpu create: %s", strerror(errno));
-	if (nvmm_vcpu_configure(&mach, &vcpu, NVMM_VCPU_CONF_CALLBACKS,
-	    &cbs) == -1)
-		die("vcpu configure: %s", strerror(errno));
 
-	/* No local APIC: hide it, so the kernel does not go looking. */
-	memset(&cpuid, 0, sizeof(cpuid));
-	cpuid.mask = 1;
-	cpuid.leaf = 0x00000001;
-	cpuid.u.mask.del.edx = 1u << 9;				/* APIC */
-	cpuid.u.mask.del.ecx = (1u << 21) | (1u << 24);	/* x2APIC, deadline */
-	if (nvmm_vcpu_configure(&mach, &vcpu, NVMM_VCPU_CONF_CPUID,
-	    &cpuid) == -1)
-		die("cpuid configure: %s", strerror(errno));
+	for (i = 0; i < ncpus; i++) {
+		struct cpu *c = &cpus[i];
+
+		c->id = i;
+		c->wait_sipi = (i != 0);
+		pthread_cond_init(&c->cond, NULL);
+		lapic_reset(c);
+		if (nvmm_vcpu_create(&mach, i, &c->vcpu) == -1)
+			die("vcpu %u create: %s", i, strerror(errno));
+		if (nvmm_vcpu_configure(&mach, &c->vcpu,
+		    NVMM_VCPU_CONF_CALLBACKS, &cbs) == -1)
+			die("vcpu configure: %s", strerror(errno));
+
+		/*
+		 * Hide what is not emulated: x2APIC and the TSC-deadline
+		 * timer always, and with one CPU the local APIC itself, so
+		 * that the kernel does not go looking for it.
+		 */
+		memset(&cpuid, 0, sizeof(cpuid));
+		cpuid.mask = 1;
+		cpuid.leaf = 0x00000001;
+		cpuid.u.mask.del.ecx = (1u << 21) | (1u << 24);
+		if (!apic_mode)
+			cpuid.u.mask.del.edx = 1u << 9;
+		if (nvmm_vcpu_configure(&mach, &c->vcpu, NVMM_VCPU_CONF_CPUID,
+		    &cpuid) == -1)
+			die("cpuid configure: %s", strerror(errno));
+	}
 
 	ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE,
 	    MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -1851,22 +2606,20 @@ main(int argc, char **argv)
 		die("gpa map: %s", strerror(errno));
 
 	/*
-	 * With no ACPI and no APIC the kernel has only the old timer to
-	 * measure the CPU's clock against. Tell it instead, and tell it to
-	 * trust the answer.
+	 * With no ACPI the kernel has little to measure the CPU's clock
+	 * against. Tell it instead, and tell it to trust the answer.
 	 */
 	(void)sysctlbyname("machdep.tsc.frequency", &tsc_hz, &len, NULL, 0);
 	snprintf(cmdline, sizeof(cmdline),
-	    "console=ttyS0 earlyprintk=serial,ttyS0 nolapic noapic acpi=off "
-	    "pci=off reboot=k panic=-1 tsc=reliable clocksource=tsc "
-	    "i8042.noaux i8042.nokbd");
+	    "console=ttyS0 earlyprintk=serial,ttyS0 %sacpi=off pci=off "
+	    "reboot=k panic=-1 tsc=reliable clocksource=tsc "
+	    "i8042.noaux i8042.nokbd", apic_mode ? "" : "nolapic noapic ");
 	if (tsc_hz != 0) {
 		snprintf(cmdline + strlen(cmdline),
 		    sizeof(cmdline) - strlen(cmdline), " tsc_early_khz=%llu",
 		    (unsigned long long)(tsc_hz / 1000));
 	}
-	/* The vmnet callback signals this thread; it must be known first. */
-	vcpu_thread = pthread_self();
+
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = kick_handler;
 	sigaction(SIGUSR1, &sa, NULL);
@@ -1883,17 +2636,31 @@ main(int argc, char **argv)
 	    " %s", extra);
 
 	entry = load_linux(kpath, ipath, cmdline);
-	setup_cpu(entry);
+	if (apic_mode)
+		mptable_build();
+	setup_cpu(&cpus[0], entry);
 
 	console_init();
-	if (pthread_create(&kick, NULL, kicker, NULL) != 0)
+	for (i = 0; i < ncpus; i++) {
+		if (pthread_create(&threads[i], NULL, cpu_thread,
+		    &cpus[i]) != 0)
+			die("cannot start a CPU thread");
+	}
+	if (pthread_create(&tick, NULL, ticker, NULL) != 0)
 		die("cannot start the timer thread");
 
-	run();
-
+	for (i = 0; i < ncpus; i++)
+		pthread_join(threads[i], NULL);
 	running = false;
-	pthread_join(kick, NULL);
-	(void)nvmm_vcpu_destroy(&mach, &vcpu);
+	pthread_join(tick, NULL);
+
+	if (verbose) {
+		for (i = 0; i < ncpus; i++)
+			fprintf(stderr, "\r\n[cpu %u: %lu returns from the "
+			    "kernel]", i, cpus[i].nruns);
+	}
+	for (i = 0; i < ncpus; i++)
+		(void)nvmm_vcpu_destroy(&mach, &cpus[i].vcpu);
 	(void)nvmm_machine_destroy(&mach);
 	fprintf(stderr, "\r\n");
 	return exit_code;

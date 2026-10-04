@@ -12,6 +12,8 @@
 # It needs, in $NVMM_DOCKER_DIR (default ~/.nvmm-docker): vmlinuz-virt,
 # initramfs-nvmm, rootfs.img and id_nvmm, as made by vmm/build-image.exp.
 # And on the PATH, or named by $NVMM_RUN and $GVPROXY: nvmm-run and gvproxy.
+# NVMM_DOCKER_CPUS and NVMM_DOCKER_MEM (megabytes) size the VM; the defaults
+# are one CPU and 2048.
 #
 # The Docker daemon is reached through a socket in that directory, which
 # only its owner can open. gvproxy carries it to the VM over SSH, with the
@@ -28,6 +30,7 @@ DIR=${NVMM_DOCKER_DIR:-"$HOME/.nvmm-docker"}
 NVMM_RUN=${NVMM_RUN:-nvmm-run}
 GVPROXY=${GVPROXY:-gvproxy}
 MEM=${NVMM_DOCKER_MEM:-2048}
+CPUS=${NVMM_DOCKER_CPUS:-1}
 SSH_PORT=${NVMM_DOCKER_SSH_PORT:-2222}
 SOCK="$DIR/docker.sock"
 CTL="$DIR/ctl.sock"
@@ -99,7 +102,7 @@ start() {
 	# comes from a pipe, which is how "stop" asks it to shut down.
 	mkfifo "$DIR/console.in"
 	"$NVMM_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-nvmm" \
-	    -d "$DIR/rootfs.img" -n "$DIR/net.sock" -m "$MEM" \
+	    -d "$DIR/rootfs.img" -n "$DIR/net.sock" -m "$MEM" -c "$CPUS" \
 	    -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet" \
 	    0<> "$DIR/console.in" > "$DIR/console.log" 2>&1 &
 	echo $! > "$DIR/vm.pid"
