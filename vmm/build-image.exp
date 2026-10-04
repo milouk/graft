@@ -48,6 +48,13 @@ set scratch $outdir/build-scratch.img
 set sock $outdir/build-serial.sock
 set qerr $outdir/build-qemu.err
 set qimg [file dirname $qemu]/qemu-img
+# Checked before anything is deleted: a mistyped name must not cost the
+# image that is already there.
+set ffile $here/flavors/$flavor.sh
+if {![file exists $ffile]} {
+    puts "### no such flavor: $flavor (see [file join $here flavors])"
+    exit 2
+}
 file mkdir $outdir
 file delete -force $sock $rootfs $script $scratch
 
@@ -65,11 +72,6 @@ close $fh
 
 # The script, with the public key in front of it, padded to a whole number
 # of sectors with newlines.
-set ffile $here/flavors/$flavor.sh
-if {![file exists $ffile]} {
-    puts "### no such flavor: $flavor (see [file join $here flavors])"
-    exit 2
-}
 set images ""
 if {[info exists env(IMAGES)]} { set images $env(IMAGES) }
 exec sh -c "printf 'PUBKEY=\"%s\"\nIMAGES=\"%s\"\n' '$pubkey' '$images' > '$script'; \

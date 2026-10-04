@@ -10,10 +10,24 @@ FLAVOR_CLI=podman
 
 flavor_setup() { :; }
 
-# Podman has no daemon to start: it writes straight into the store.
+# Podman has no daemon to start: it writes straight into the store. It does
+# not guess a registry for a short name, so one is given the way docker
+# would: a first component with a dot or a colon in it, or "localhost", is a
+# registry already.
 flavor_pull() {
+	store=/mnt/var/lib/containers/storage
 	for img in "$@"; do
-		podman --root /mnt/var/lib/containers/storage pull -q \
-		    "docker.io/library/$img"
+		case "$img" in
+		*/*)	case "${img%%/*}" in
+			*.*|*:*|localhost) ;;
+			*) img="docker.io/$img" ;;
+			esac ;;
+		*)	img="docker.io/library/$img" ;;
+		esac
+		podman --root "$store" pull -q "$img"
 	done
+	# Podman's own database records the store as being under /mnt, and
+	# would refuse the one it finds at boot. It holds nothing yet: the
+	# images are in the store itself.
+	rm -rf "$store/db.sql" "$store/libpod"
 }

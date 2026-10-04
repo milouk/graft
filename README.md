@@ -243,7 +243,7 @@ nothing at run time needs it.
 
 ```sh
 ./tools/build-qemu.sh       # prints where it put qemu-system-x86_64
-ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.nvmm-docker
+ACCEL=nvmm FLAVOR=docker vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.nvmm-docker
 cp <vmlinuz-virt> ~/.nvmm-docker/
 ```
 
@@ -264,8 +264,8 @@ vmm/nvmm-docker ssh                         # a shell in the VM
 vmm/nvmm-docker stop
 ```
 
-To leave Docker out altogether, build the image with `FLAVOR=containerd`.
-It then holds containerd and nerdctl and nothing of Docker's: smaller on
+To leave Docker out altogether, build the image without `FLAVOR`, which
+gives the default, `containerd`. It then holds containerd and nerdctl and nothing of Docker's: smaller on
 disk and lighter in memory, at the price of the Docker API. Nothing that
 expects `docker.sock` works with it; containers are run with nerdctl, which
 takes docker's command line, inside the VM:
@@ -275,7 +275,7 @@ vmm/nvmm-docker nerdctl run --rm alpine uname -a
 vmm/nvmm-docker nerdctl compose up
 ```
 
-The default image has the Docker daemon and not its client, which stays on
+The `docker` image has the Docker daemon and not its client, which stays on
 the Mac.
 
 `NVMM_DOCKER_CPUS` and `NVMM_DOCKER_MEM` size the VM; the defaults are at
