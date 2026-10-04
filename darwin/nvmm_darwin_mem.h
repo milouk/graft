@@ -14,6 +14,7 @@ struct nvmm_darwin_mem_stats {
 	unsigned int last_large;	/* 2M runs obtained */
 	unsigned int last_wanted;	/* 2M runs that would have fitted */
 	unsigned int last_usec;		/* time spent asking for them */
+	long pinned_chunks;		/* 2M pieces of borrowed memory pinned now */
 };
 extern struct nvmm_darwin_mem_stats nvmm_darwin_mem_stats;
 

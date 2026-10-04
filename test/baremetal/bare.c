@@ -453,6 +453,10 @@ struct port_membuf {
 	void *va;
 	size_t size;
 	size_t npages;
+	/* Borrowed buffers: which chunks have been pinned, and the alias. */
+	bool lazy;
+	uint64_t pinned;
+	int alias;
 };
 
 #define BARE_LARGE		(2UL << 20)
@@ -496,9 +500,81 @@ port_membuf_create(size_t size)
 	return buf;
 }
 
+/*
+ * "The calling process's memory at uva". There is no process here, so the
+ * memory is made up on the spot and the test reaches it through
+ * bare_hva_ptr(), as it does for a fixed mapping. What matters is kept:
+ * nothing may ask for a physical address in a chunk that was not pinned
+ * first, and the pinned chunks are counted.
+ */
+struct port_membuf *
+port_membuf_borrow(uintptr_t uva, size_t size)
+{
+	struct port_membuf *buf;
+	unsigned int i;
+
+	if (size > 64 * PORT_LAZY_CHUNK)
+		return NULL;
+	for (i = 0; i < BARE_MAX_ALIASES - 1; i++) {
+		if (!bare_aliases[i].used)
+			break;
+	}
+	if (i == BARE_MAX_ALIASES - 1)
+		return NULL;
+	buf = port_malloc(sizeof(*buf));
+	if (buf == NULL)
+		return NULL;
+	buf->size = size;
+	buf->npages = (size + 4095) / 4096;
+	buf->va = bump(buf->npages * 4096, BARE_LARGE);
+	if (buf->va == NULL) {
+		port_free(buf, sizeof(*buf));
+		return NULL;
+	}
+	memset(buf->va, 0, buf->npages * 4096);
+	buf->lazy = true;
+	buf->pinned = 0;
+	buf->alias = (int)i;
+	bare_aliases[i].used = true;
+	bare_aliases[i].hva = uva;
+	bare_aliases[i].ptr = buf->va;
+	bare_aliases[i].size = size;
+	bare_stats.pages_live += buf->npages;
+	bare_stats.membufs_live++;
+	return buf;
+}
+
+int
+port_membuf_populate(struct port_membuf *buf, size_t off, size_t len)
+{
+	size_t c;
+
+	if (!buf->lazy)
+		return 0;
+	if (off + len > buf->npages * 4096 || len == 0)
+		port_panic("port_membuf_populate: range out of the buffer");
+	for (c = off / PORT_LAZY_CHUNK; c <= (off + len - 1) / PORT_LAZY_CHUNK;
+	    c++) {
+		if ((buf->pinned & (1ULL << c)) == 0) {
+			buf->pinned |= 1ULL << c;
+			bare_stats.chunks_pinned++;
+		}
+	}
+	return 0;
+}
+
 void
 port_membuf_destroy(struct port_membuf *buf)
 {
+	if (buf->lazy) {
+		size_t c;
+
+		for (c = 0; c < 64; c++) {
+			if (buf->pinned & (1ULL << c))
+				bare_stats.chunks_pinned--;
+		}
+		bare_aliases[buf->alias].used = false;
+	}
 	port_pages_free(buf->va, (uint64_t)buf->va, buf->npages);
 	port_free(buf, sizeof(*buf));
 	bare_stats.membufs_live--;
@@ -509,6 +585,9 @@ port_membuf_pa(struct port_membuf *buf, size_t off)
 {
 	if (off >= buf->npages * 4096)
 		port_panic("port_membuf_pa: offset %#lx out of range",
+		    (uint64_t)off);
+	if (buf->lazy && (buf->pinned & (1ULL << (off / PORT_LAZY_CHUNK))) == 0)
+		port_panic("port_membuf_pa: offset %#lx is not pinned",
 		    (uint64_t)off);
 	return (uint64_t)buf->va + off;
 }

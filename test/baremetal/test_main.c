@@ -443,6 +443,9 @@ test_large_pages(void)
 	const unsigned long nlarge = port_vm_nlarge;
 	uint8_t *big;
 
+	/* 2M pages are for memory pinned up front; ask for that. */
+	port_lazy_guest_memory = 0;
+
 	memset(&hm, 0, sizeof(hm));
 	hm.machid = machid;
 	hm.hva = BIG_HVA;
@@ -510,6 +513,109 @@ test_large_pages(void)
 	set_rip(0x3000);
 	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
 	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
+
+	port_lazy_guest_memory = 1;
+}
+
+/*
+ * Guest RAM borrowed from the process is pinned and entered into the guest's
+ * tables only as the guest touches it, a chunk at a time. An access the
+ * mapping does not allow, or one outside any mapping, still goes to the
+ * emulator.
+ */
+static void
+test_lazy_memory(void)
+{
+	static const uint8_t halt[] = { 0xF4 };
+	static const uint8_t code[] = {
+		0xB8, 0x00, 0x90,		/* mov  $0x9000,%ax  */
+		0x8E, 0xD8,			/* mov  %ax,%ds      */
+		0xC6, 0x06, 0x00, 0x00, 0x99,	/* movb $0x99,0x0000 */
+		0xF4,				/* hlt               */
+	};
+	/* Guest 0 is this far into the buffer, so that guest 0x80000 is
+	 * where the buffer's second chunk begins. */
+	const uint64_t skew = PORT_LAZY_CHUNK - 0x80000;
+	struct nvmm_ioc_hva_map hm;
+	struct nvmm_ioc_hva_unmap hu;
+	struct nvmm_ioc_gpa_map gm;
+	struct nvmm_vcpu_exit *exit;
+	const long pinned0 = bare_stats.chunks_pinned;
+	uint8_t *mem;
+
+	memset(&hm, 0, sizeof(hm));
+	hm.machid = machid;
+	hm.hva = BIG_HVA;
+	hm.size = BIG_SIZE;
+	CHECK_EQ(ioc(NVMM_IOC_HVA_MAP, &hm), 0);
+	mem = bare_hva_ptr(BIG_HVA);
+	CHECK(mem != NULL);
+
+	/* 1M of it at guest 0, over the RAM that was there. Nothing pinned. */
+	memset(&gm, 0, sizeof(gm));
+	gm.machid = machid;
+	gm.hva = BIG_HVA + skew;
+	gm.gpa = 0;
+	gm.size = 0x100000;
+	gm.prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+	CHECK_EQ(ioc(NVMM_IOC_GPA_MAP, &gm), 0);
+	CHECK_EQ(bare_stats.chunks_pinned, pinned0);
+
+	/* The process fills its memory before the guest has touched any. */
+	memcpy(mem + skew + 0x3000, halt, sizeof(halt));
+	memcpy(mem + skew + 0x4000, code, sizeof(code));
+
+	/* Running from the first chunk pins that chunk and no other. */
+	set_rip(0x3000);
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(bare_stats.chunks_pinned, pinned0 + 1);
+	set_rip(0x3000);
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(bare_stats.chunks_pinned, pinned0 + 1);
+
+	/* A write across the boundary pins the second, and lands in it. */
+	set_rip(0x4000);
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(bare_stats.chunks_pinned, pinned0 + 2);
+	CHECK_EQ(mem[skew + MMIO_GPA], 0x99);
+	CHECK_EQ(mem[PORT_LAZY_CHUNK + 0x10000], 0x99);
+
+	/* Outside the mapping there is still nothing: the emulator's. */
+	{
+		static const uint8_t far[] = {
+			0xB8, 0xFF, 0xFF,		/* mov  $0xffff,%ax  */
+			0x8E, 0xD8,			/* mov  %ax,%ds      */
+			0xC6, 0x06, 0x10, 0x80, 0x77,	/* movb $0x77,0x8010 */
+			0xF4,				/* hlt               */
+		};
+
+		memcpy(mem + skew + 0x5000, far, sizeof(far));
+		set_rip(0x5000);
+		exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
+		CHECK_EQ(exit->u.mem.gpa, 0xFFFF0 + 0x8010);
+		CHECK_EQ(bare_stats.chunks_pinned, pinned0 + 2);
+	}
+
+	/* Read-only borrowed memory: a write is refused, not granted. */
+	gpa_unmap(0, 0x100000);
+	gm.prot = PROT_READ | PROT_EXEC;
+	CHECK_EQ(ioc(NVMM_IOC_GPA_MAP, &gm), 0);
+	mem[skew + MMIO_GPA] = 0;
+	set_rip(0x4000);
+	exit = run_expect(NVMM_VCPU_EXIT_MEMORY);
+	CHECK_EQ(exit->u.mem.gpa, MMIO_GPA);
+	CHECK((exit->u.mem.prot & PROT_WRITE) != 0);
+	CHECK_EQ(mem[skew + MMIO_GPA], 0x00);
+
+	/* Put the original RAM back; the pins go with the buffer. */
+	gpa_unmap(0, 0x100000);
+	gpa_map(0, 0, RAM_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+	memset(&hu, 0, sizeof(hu));
+	hu.machid = machid;
+	hu.hva = BIG_HVA;
+	hu.size = BIG_SIZE;
+	CHECK_EQ(ioc(NVMM_IOC_HVA_UNMAP, &hu), 0);
+	CHECK_EQ(bare_stats.chunks_pinned, pinned0);
 }
 
 /* CPUID is answered by the engine without involving the emulator. */
@@ -707,6 +813,7 @@ test_teardown(void)
 	CHECK_EQ(bare_stats.malloc_bytes, 0);
 	CHECK_EQ(bare_stats.pages_live, 0);
 	CHECK_EQ(bare_stats.membufs_live, 0);
+	CHECK_EQ(bare_stats.chunks_pinned, 0);
 	CHECK_EQ(bare_stats.maps_live, 0);
 	CHECK_EQ(bare_stats.locks_live, 0);
 	CHECK(!port_preempt_disabled());
@@ -757,6 +864,7 @@ kmain(void)
 		RUN(test_io_and_hlt);
 		RUN(test_memory);
 		RUN(test_large_pages);
+		RUN(test_lazy_memory);
 		RUN(test_cpuid);
 		RUN(test_fpu);
 		RUN(test_exit_budget);

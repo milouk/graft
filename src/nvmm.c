@@ -563,9 +563,24 @@ nvmm_do_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		if (exit->u.mem.gpa >= mach->gpa_end) {
 			break;
 		}
+#if defined(NVMM_PORT)
+		/*
+		 * Guest RAM that is pinned on demand can fail to be: the
+		 * host is out of memory. That must not be mistaken for an
+		 * access to a device and handed to the emulator.
+		 */
+		ret = os_vmspace_fault(vm, exit->u.mem.gpa, exit->u.mem.prot);
+		if (ret == ENOMEM) {
+			return ENOMEM;
+		}
+		if (ret) {
+			break;
+		}
+#else
 		if (os_vmspace_fault(vm, exit->u.mem.gpa, exit->u.mem.prot)) {
 			break;
 		}
+#endif
 
 		/* Got a signal? Or pending resched? Leave. */
 		if (__predict_false(os_return_needed())) {
@@ -710,6 +725,10 @@ nvmm_hmapping_unmap(struct nvmm_machine *mach, uintptr_t hva, size_t size)
 			continue;
 		}
 
+#if defined(NVMM_PORT)
+		/* Borrowed memory was never mapped: it is the process's. */
+		if (!os_vmobj_borrowed(hmapping->vmobj))
+#endif
 		os_vmobj_unmap(os_curproc_map, hmapping->hva,
 		    hmapping->hva + hmapping->size, false);
 
@@ -744,6 +763,20 @@ nvmm_hva_map(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
 
 	hmapping->hva = args->hva;
 	hmapping->size = args->size;
+#if defined(NVMM_PORT)
+	/*
+	 * Guest RAM: use the memory the process already has there, and pin
+	 * it as the guest touches it, instead of replacing it with wired
+	 * memory of the full size. Nothing needs mapping then.
+	 */
+	if (port_lazy_guest_memory && hmapping->size >= PORT_LAZY_MIN) {
+		hmapping->vmobj = os_vmobj_borrow(hmapping->hva,
+		    hmapping->size);
+		if (hmapping->vmobj != NULL) {
+			goto out;
+		}
+	}
+#endif
 	hmapping->vmobj = os_vmobj_create(hmapping->size);
 #if defined(NVMM_PORT)
 	/*

@@ -45,6 +45,8 @@ struct port_membuf;
 int	port_pages_alloc(size_t npages, void **va, uint64_t *pa);
 void	port_pages_free(void *va, uint64_t pa, size_t npages);
 struct port_membuf *port_membuf_create(size_t size);
+struct port_membuf *port_membuf_borrow(uintptr_t uva, size_t size);
+int	port_membuf_populate(struct port_membuf *buf, size_t off, size_t len);
 void	port_membuf_destroy(struct port_membuf *buf);
 uint64_t port_membuf_pa(struct port_membuf *buf, size_t off);
 int	port_membuf_map(struct port_membuf *buf, int space, size_t off,
@@ -194,6 +196,16 @@ struct port_membuf {
 	IOMemoryDescriptor **parts;
 	unsigned int nparts;
 	size_t size;
+	/*
+	 * A borrowed buffer has none of the above. It is 'size' bytes of
+	 * 'task' at 'uva', and 'chunks' holds, for each NVMM_LARGE-sized
+	 * piece that has been pinned, the descriptor that pins it.
+	 */
+	bool borrowed;
+	task_t task;
+	uintptr_t uva;
+	IOMemoryDescriptor **chunks;
+	size_t nchunks;
 };
 
 static uint64_t
@@ -375,9 +387,96 @@ port_membuf_create(size_t size)
 	return buf;
 }
 
+/*
+ * The process's own memory, pinned piece by piece as the guest touches it.
+ *
+ * Pinning a range of a process's memory and learning its physical addresses
+ * is what every driver that does I/O straight into a user buffer does, and
+ * IOKit's way of doing it is a descriptor for the range and prepare(). The
+ * pages stay put until complete(), even if the process unmaps them or dies.
+ */
+struct port_membuf *
+port_membuf_borrow(uintptr_t uva, size_t size)
+{
+	struct port_membuf *buf;
+
+	if ((uva & (NVMM_PAGE - 1)) != 0 || (size & (NVMM_PAGE - 1)) != 0 ||
+	    size == 0)
+		return NULL;
+	buf = (struct port_membuf *)IOMalloc(sizeof(*buf));
+	if (buf == NULL)
+		return NULL;
+	bzero(buf, sizeof(*buf));
+	buf->nchunks = (size + NVMM_LARGE - 1) / NVMM_LARGE;
+	buf->chunks = (IOMemoryDescriptor **)IOMalloc(buf->nchunks *
+	    sizeof(*buf->chunks));
+	if (buf->chunks == NULL) {
+		IOFree(buf, sizeof(*buf));
+		return NULL;
+	}
+	bzero(buf->chunks, buf->nchunks * sizeof(*buf->chunks));
+	buf->borrowed = true;
+	buf->task = current_task();
+	buf->uva = uva;
+	buf->size = size;
+	return buf;
+}
+
+/* The caller serialises this for any one buffer. */
+int
+port_membuf_populate(struct port_membuf *buf, size_t off, size_t len)
+{
+	size_t c;
+
+	if (!buf->borrowed)
+		return 0;
+	if (len == 0 || off + len > buf->size || off + len < off)
+		return EINVAL;
+	/* It is this process's memory only while this process is asking. */
+	if (current_task() != buf->task)
+		return EFAULT;
+
+	for (c = off / NVMM_LARGE; c <= (off + len - 1) / NVMM_LARGE; c++) {
+		const size_t coff = c * NVMM_LARGE;
+		const size_t clen = (buf->size - coff < NVMM_LARGE) ?
+		    buf->size - coff : NVMM_LARGE;
+		IOMemoryDescriptor *d;
+
+		if (buf->chunks[c] != NULL)
+			continue;
+		d = IOMemoryDescriptor::withAddressRange(buf->uva + coff, clen,
+		    kIODirectionInOut | kIOMemoryMapperNone, buf->task);
+		if (d == NULL)
+			return ENOMEM;
+		if (d->prepare() != kIOReturnSuccess) {
+			d->release();
+			printf("nvmm: cannot pin %zu KB of guest memory\n",
+			    clen >> 10);
+			return ENOMEM;
+		}
+		buf->chunks[c] = d;
+		nvmm_darwin_mem_stats.pinned_chunks++;
+	}
+	return 0;
+}
+
 void
 port_membuf_destroy(struct port_membuf *buf)
 {
+	if (buf->borrowed) {
+		size_t c;
+
+		for (c = 0; c < buf->nchunks; c++) {
+			if (buf->chunks[c] != NULL) {
+				buf->chunks[c]->complete();
+				buf->chunks[c]->release();
+				nvmm_darwin_mem_stats.pinned_chunks--;
+			}
+		}
+		IOFree(buf->chunks, buf->nchunks * sizeof(*buf->chunks));
+		IOFree(buf, sizeof(*buf));
+		return;
+	}
 	buf->desc->complete();
 	buf->desc->release();
 	if (buf->parts != NULL) {
@@ -393,7 +492,17 @@ port_membuf_pa(struct port_membuf *buf, size_t off)
 	IOByteCount seglen = 0;
 	addr64_t phys;
 
-	phys = buf->desc->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
+	if (buf->borrowed) {
+		const size_t c = off / NVMM_LARGE;
+
+		if (c >= buf->nchunks || buf->chunks[c] == NULL)
+			panic("nvmm: guest memory at %#zx is not pinned", off);
+		phys = buf->chunks[c]->getPhysicalSegment(off - c * NVMM_LARGE,
+		    &seglen, kIOMemoryMapperNone);
+	} else {
+		phys = buf->desc->getPhysicalSegment(off, &seglen,
+		    kIOMemoryMapperNone);
+	}
 	if (phys == 0)
 		panic("nvmm: guest memory has no physical page at %#zx", off);
 	return phys;
@@ -408,6 +517,9 @@ port_membuf_map(struct port_membuf *buf, int space, size_t off, size_t size,
 
 	if (off + size > buf->size || off + size < off)
 		return EINVAL;
+	/* Borrowed memory is already where the process wants it. */
+	if (buf->borrowed)
+		return ENOTSUP;
 
 	if (space == PORT_SPACE_KERNEL) {
 		if (fixed)

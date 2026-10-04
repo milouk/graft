@@ -10,6 +10,7 @@ struct bare_stats {
 	long maps_live;		/* port_membuf_map() not yet unmapped */
 	long locks_live;	/* initialised and not destroyed */
 	unsigned long ipis;	/* port_ipi_broadcast() calls */
+	long chunks_pinned;	/* of borrowed buffers, by port_membuf_populate() */
 };
 extern struct bare_stats bare_stats;
 

@@ -23,7 +23,10 @@ struct os_vmobj {
 	volatile unsigned int refcnt;
 	size_t size;
 	struct port_membuf *buf;
+	bool lazy;		/* borrowed from the process, pinned on demand */
 };
+
+int port_lazy_guest_memory = 1;
 
 /* One contiguous run of an object mapped somewhere. */
 struct port_mapping {
@@ -32,6 +35,7 @@ struct port_mapping {
 	vsize_t size;
 	os_vmobj_t *obj;
 	voff_t off;
+	int prot;		/* guest mappings: NPT_PROT_* */
 	/* Kernel and user mappings only. */
 	void *cookie;
 	int pid;
@@ -151,16 +155,65 @@ os_vmspace_destroy(os_vmspace_t *vs)
 	port_free(vs, sizeof(*vs));
 }
 
+static int port_prot_to_npt(int);
+
+/*
+ * The guest touched an address its nested page table has nothing for.
+ *
+ * Memory that was allocated and pinned when it was mapped is all in the
+ * table already, so for that this is never RAM: report failure, and the core
+ * hands the access to the emulator. Memory borrowed from the process is
+ * entered here instead, a chunk at a time, on its first touch. That is what
+ * makes a guest cost what it uses rather than what it was given.
+ */
 int
-os_vmspace_fault(os_vmspace_t *vs __unused, vaddr_t va __unused,
-    int prot __unused)
+os_vmspace_fault(os_vmspace_t *vs, vaddr_t gpa, int prot)
 {
-	/*
-	 * Guest RAM is entered into the nested page table when it is mapped,
-	 * so there is never anything to fault in. Reporting failure makes the
-	 * core hand the access to the emulator as a memory exit.
-	 */
-	return EFAULT;
+	const int want = port_prot_to_npt(prot) | NPT_PROT_READ;
+	struct port_mapping *m;
+	voff_t off, coff, cend, o;
+	int error = 0;
+
+	port_mtx_lock(&vs->lock);
+
+	for (m = vs->maps; m != NULL; m = m->next) {
+		if (gpa >= m->start && gpa - m->start < m->size)
+			break;
+	}
+	if (m == NULL || !m->obj->lazy || (want & ~m->prot) != 0) {
+		port_mtx_unlock(&vs->lock);
+		return EFAULT;
+	}
+	/* Already there: another vCPU got here first. Just run again. */
+	if (npt_lookup(&vs->npt, gpa & ~(vaddr_t)NVMM_PAGE_MASK, NULL, NULL)) {
+		port_mtx_unlock(&vs->lock);
+		return 0;
+	}
+
+	/* The chunk of the buffer around it, as far as this mapping goes. */
+	off = m->off + (gpa - m->start);
+	coff = off & ~(voff_t)(PORT_LAZY_CHUNK - 1);
+	cend = coff + PORT_LAZY_CHUNK;
+	if (coff < m->off)
+		coff = m->off;
+	if (cend > m->off + m->size)
+		cend = m->off + m->size;
+
+	if (port_membuf_populate(m->obj->buf, (size_t)coff,
+	    (size_t)(cend - coff)) != 0)
+		error = ENOMEM;
+	for (o = coff; error == 0 && o < cend; o += NVMM_PAGE_SIZE) {
+		const vaddr_t g = m->start + (o - m->off);
+
+		if (npt_lookup(&vs->npt, g, NULL, NULL))
+			continue;
+		if (npt_map(&vs->npt, g, port_membuf_pa(m->obj->buf,
+		    (size_t)o), m->prot) != 0)
+			error = ENOMEM;
+	}
+
+	port_mtx_unlock(&vs->lock);
+	return error;
 }
 
 os_vmmap_t *
@@ -210,6 +263,32 @@ os_vmobj_create(voff_t size)
 	obj->size = (size_t)size;
 	obj->refcnt = 1;
 	return obj;
+}
+
+/* The calling process's memory at [uva, uva+size), as an object. */
+os_vmobj_t *
+os_vmobj_borrow(vaddr_t uva, voff_t size)
+{
+	os_vmobj_t *obj;
+
+	obj = port_zalloc(sizeof(*obj));
+	if (obj == NULL)
+		return NULL;
+	obj->buf = port_membuf_borrow((uintptr_t)uva, (size_t)size);
+	if (obj->buf == NULL) {
+		port_free(obj, sizeof(*obj));
+		return NULL;
+	}
+	obj->size = (size_t)size;
+	obj->refcnt = 1;
+	obj->lazy = true;
+	return obj;
+}
+
+bool
+os_vmobj_borrowed(os_vmobj_t *obj)
+{
+	return obj->lazy;
 }
 
 void
@@ -367,7 +446,8 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 		return error;
 	}
 
-	for (done = 0; done < size; done += step) {
+	/* Borrowed memory is entered as the guest touches it, not now. */
+	for (done = 0; !obj->lazy && done < size; done += step) {
 		const uint64_t hpa = port_membuf_pa(obj->buf,
 		    (size_t)(off + done));
 
@@ -395,6 +475,7 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 	m->size = size;
 	m->obj = obj;
 	m->off = off;
+	m->prot = nprot;
 	os_vmobj_ref(obj);
 	m->next = vs->maps;
 	vs->maps = m;

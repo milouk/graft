@@ -111,6 +111,24 @@ struct port_membuf *port_membuf_create(size_t size);
 void	port_membuf_destroy(struct port_membuf *buf);
 uint64_t port_membuf_pa(struct port_membuf *buf, size_t off);
 
+/*
+ * A buffer that is not allocated at all: it is the calling process's own
+ * memory at [uva, uva+size), and nothing of it is pinned until asked for.
+ * This is how guest RAM is kept from costing its full size from the start.
+ * port_membuf_populate() pins a range, after which port_membuf_pa() may be
+ * asked about it; for an ordinary buffer it has nothing to do. Returns NULL
+ * if the platform cannot do this, and the caller then allocates as usual.
+ */
+struct port_membuf *port_membuf_borrow(uintptr_t uva, size_t size);
+int	port_membuf_populate(struct port_membuf *buf, size_t off, size_t len);
+
+/* Guest memory of this size or more is borrowed and pinned on demand... */
+#define PORT_LAZY_MIN		(2UL << 20)
+/* ...this much at a time, on the first touch of any of it. */
+#define PORT_LAZY_CHUNK		(2UL << 20)
+/* A switch, for comparing against memory pinned up front in 2M pages. */
+extern int port_lazy_guest_memory;
+
 #define PORT_SPACE_KERNEL	0
 #define PORT_SPACE_USER		1
 #define PORT_SPACE_GUEST	2
@@ -294,6 +312,8 @@ void		os_vmobj_unmap(os_vmmap_t *, vaddr_t, vaddr_t, bool);
 
 /* Translate a guest-physical address by walking the space's nested page table. */
 extern unsigned long port_vm_nlarge;
+os_vmobj_t *	os_vmobj_borrow(vaddr_t, voff_t);
+bool		os_vmobj_borrowed(os_vmobj_t *);
 bool		port_vm_guest_lookup(os_vmspace_t *, vaddr_t, paddr_t *);
 
 /* Drop every user mapping a process created, when it closes the device. */
