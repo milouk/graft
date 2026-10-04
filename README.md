@@ -11,9 +11,11 @@ it gives QEMU, and anything built on QEMU, hardware-speed virtual machines.
 
 ## Status
 
-**No guest has run on real hardware yet.** The engine has only run under
-emulation, and the macOS glue has only run without the engine. Read this table
-before trusting any of it.
+**Guests run on real hardware, but only test guests.** On 2026-10-04 the kext
+loaded on a Ryzen 7 2700 running macOS 10.15.5 and passed `nvmm-guest-test`
+(5,598 checks): small real-mode programs, not an operating system. No OS has
+been booted in it yet, through QEMU or otherwise. Read this table before
+trusting any of it.
 
 | Piece | State |
 |---|---|
@@ -22,9 +24,9 @@ before trusting any of it.
 | Guest-memory layer (`port/nvmm_port_vm.c`) | Exercised by the engine tests, with leak accounting |
 | World-switch assembly (host VMCB variant) | Exercised by the engine tests; host state checked after every guest run |
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
-| Engine and glue together, on an AMD CPU | **Never run** |
+| Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
-| QEMU with `-accel nvmm` on macOS | Builds (`tools/build-qemu.sh`) and starts a machine through the driver on real Sequoia, with the stand-in engine. **Has never run guest code** |
+| QEMU with `-accel nvmm` on macOS | Builds (`tools/build-qemu.sh`) and starts a machine through the driver on real Sequoia, with the stand-in engine. **Has never run guest code**: QEMU has not yet been run against the real engine |
 
 **macOS versions.** One binary is meant to serve macOS 10.13 (the first with
 AMD Ryzen support in the Hackintosh world) through 15. What that rests on:
@@ -32,7 +34,8 @@ the kext imports only exported symbols, and `tools/check-kpi.sh` confirms
 each of them against the kernel sources of every release in that range. It
 has been *loaded* on 15.7.9 only.
 
-What the tests cannot show, because the emulator hides it:
+What the emulator tests cannot show, because the emulator hides it (the first
+two have since passed on the Ryzen, in stage 4 of `nvmm-guest-test`):
 
 - **TLB flushing.** QEMU's software AMD-V flushes on every world switch, so a
   flush the engine forgets would go unnoticed. The mutation checker lists this
@@ -188,8 +191,8 @@ halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
 
 ## First load on real hardware
 
-The self-test kext has been through this on an Intel Mac. The real kext, with
-the engine, has not been loaded anywhere. This is the plan for it.
+This is the procedure that was followed for the first load, on macOS 10.15.5
+with SIP disabled; it went through without a panic.
 
 Requirements: an AMD CPU with SVM enabled in the firmware, a system that
 accepts unsigned kernel extensions (`csr-active-config` with the kext-signing
@@ -224,8 +227,11 @@ flushing after an unmap, and next-RIP save.
 
 ## Known gaps
 
-- Nothing has run guest code outside the emulator tests. The first real
-  guest needs an AMD machine.
+- No operating system has been booted as a guest. Long mode, paging inside
+  the guest, interrupt injection and virtual devices are all unexercised on
+  real hardware.
+- Whether guest memory really ends up in 2M pages on the Ryzen is not known:
+  the guest test passes either way and does not report it.
 - Sleep and wake: the notifications arrive and the glue survives a cycle on
   real hardware, and the engine's suspend path is tested under emulation, but
   the two have not been tested together, and never with a guest running.
