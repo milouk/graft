@@ -64,7 +64,7 @@ exec $qimg create -f raw $scratch 64M
 # so that rebuilding the image does not lock out a running setup's key.
 set key $outdir/id_nvmm
 if {![file exists $key]} {
-    exec ssh-keygen -q -t ed25519 -N "" -C nvmm-docker -f $key
+    exec ssh-keygen -q -t ed25519 -N "" -C graft -f $key
 }
 set fh [open $key.pub]
 set pubkey [string trim [read $fh]]
@@ -130,7 +130,7 @@ for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
 if {$isize <= 0} { puts "### no initramfs size reported"; exit 1 }
 exec head -c $isize $scratch > $initramfs
 file delete -force $script $scratch $sock
-# What nvmm-docker needs to know about the image, in a form it can source.
+# What graft needs to know about the image, in a form it can source.
 exec sh -c ". '$ffile'; printf 'FLAVOR=%s\nFLAVOR_SOCKET=%s\nFLAVOR_CLI=%s\n' \
     '$flavor' \"\$FLAVOR_SOCKET\" \"\$FLAVOR_CLI\" > '$outdir/flavor.env'"
 puts "\n### built $rootfs ($flavor) and $initramfs ($isize bytes); key in $key"

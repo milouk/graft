@@ -1,16 +1,16 @@
 #!/bin/sh
 #
-# test.sh — start the container VM with nvmm-docker and run containers in
+# test.sh — start the container VM with graft and run containers in
 # it, by whichever way its image offers: an API socket, a command in the VM,
-# or both. Needs what nvmm-docker needs, and for an image with a socket, a
+# or both. Needs what graft needs, and for an image with a socket, a
 # docker client (named by $DOCKER, default "docker").
 #
 #   vmm/test.sh
 
 set -eu
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-ND="$HERE/nvmm-docker"
-DIR=${NVMM_DOCKER_DIR:-"$HOME/.nvmm-docker"}
+ND="$HERE/graft"
+DIR=${GRAFT_DIR:-"$HOME/.graft"}
 DOCKER=${DOCKER:-docker}
 FLAVOR_SOCKET=
 FLAVOR_CLI=

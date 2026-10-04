@@ -1,19 +1,19 @@
 #!/bin/sh
 #
-# nvmm-docker — run the container VM in the background and connect this Mac
+# graft — run the container VM in the background and connect this Mac
 # to it.
 #
-#   nvmm-docker start     boot the VM and wait until its runtime answers
-#   nvmm-docker stop      shut the VM down
-#   nvmm-docker status    say whether it is running
-#   nvmm-docker console   show what the VM has printed
-#   nvmm-docker ssh [cmd] a shell, or a command, in the VM
-#   nvmm-docker <cli> …   the runtime's own command, run in the VM
+#   graft start     boot the VM and wait until its runtime answers
+#   graft stop      shut the VM down
+#   graft status    say whether it is running
+#   graft console   show what the VM has printed
+#   graft ssh [cmd] a shell, or a command, in the VM
+#   graft <cli> …   the runtime's own command, run in the VM
 #
-# It needs, in $NVMM_DOCKER_DIR (default ~/.nvmm-docker), what
+# It needs, in $GRAFT_DIR (default ~/.graft), what
 # vmm/build-image.exp makes, plus the kernel: vmlinuz-virt, initramfs-nvmm,
 # rootfs.img, id_nvmm and flavor.env. And on the PATH, or named by $NVMM_RUN
-# and $GVPROXY: nvmm-run and gvproxy. NVMM_DOCKER_CPUS and NVMM_DOCKER_MEM
+# and $GVPROXY: nvmm-run and gvproxy. GRAFT_CPUS and GRAFT_MEM
 # (megabytes) size the VM; the defaults are one CPU and 2048.
 #
 # What the image runs containers with was chosen when it was built (see
@@ -23,23 +23,23 @@
 #     directory, which only its owner can open: point DOCKER_HOST at it.
 #     gvproxy carries it to the VM over SSH, with the image's key.
 #   - A runtime with a command of its own (nerdctl, podman) can be run in the
-#     VM: "nvmm-docker nerdctl run --rm alpine true".
+#     VM: "graft nerdctl run --rm alpine true".
 #
 # Ports that containers publish (-p) appear on this Mac too, on the loopback
-# address; set NVMM_DOCKER_BIND=0.0.0.0 to offer them to the network as
+# address; set GRAFT_BIND=0.0.0.0 to offer them to the network as
 # well. TCP only.
 
 set -eu
 
-DIR=${NVMM_DOCKER_DIR:-"$HOME/.nvmm-docker"}
+DIR=${GRAFT_DIR:-"$HOME/.graft"}
 NVMM_RUN=${NVMM_RUN:-nvmm-run}
 GVPROXY=${GVPROXY:-gvproxy}
-MEM=${NVMM_DOCKER_MEM:-2048}
-CPUS=${NVMM_DOCKER_CPUS:-1}
-SSH_PORT=${NVMM_DOCKER_SSH_PORT:-2222}
+MEM=${GRAFT_MEM:-2048}
+CPUS=${GRAFT_CPUS:-1}
+SSH_PORT=${GRAFT_SSH_PORT:-2222}
 SOCK="$DIR/docker.sock"
 CTL="$DIR/ctl.sock"
-BIND=${NVMM_DOCKER_BIND:-127.0.0.1}
+BIND=${GRAFT_BIND:-127.0.0.1}
 GUEST=192.168.127.2		# the address gvproxy gives the VM
 FLAVOR=containerd
 FLAVOR_SOCKET=
@@ -197,7 +197,7 @@ status)
 	fi ;;
 console) cat "$DIR/console.log" ;;
 ssh)	 shift; vm_ssh "$@" ;;
-"")	 echo "usage: nvmm-docker start|stop|status|console|ssh|<cli>" >&2; exit 2 ;;
+"")	 echo "usage: graft start|stop|status|console|ssh|<cli>" >&2; exit 2 ;;
 "$FLAVOR_CLI")
 	# The runtime's own command, in the VM. ssh joins its arguments with
 	# spaces and the far shell splits them again, so each is quoted for
@@ -208,5 +208,5 @@ ssh)	 shift; vm_ssh "$@" ;;
 		cmd="$cmd '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
 	done
 	if [ -t 0 ]; then vm_ssh -t "$cmd"; else vm_ssh "$cmd"; fi ;;
-*)	 echo "usage: nvmm-docker start|stop|status|console|ssh|<cli>" >&2; exit 2 ;;
+*)	 echo "usage: graft start|stop|status|console|ssh|<cli>" >&2; exit 2 ;;
 esac

@@ -78,7 +78,7 @@ for s in mount-ro killprocs savecache; do
 done
 for s in cgroups $FLAVOR_SERVICE; do chroot /mnt rc-update add $s default; done
 # An SSH server, with the host's key as the only way in. The host reaches
-# the runtime's socket, or runs its command, through it; see vmm/nvmm-docker.
+# the runtime's socket, or runs its command, through it; see vmm/graft.
 for s in sshd; do chroot /mnt rc-update add $s default; done
 # Alpine ships its SSH server with forwarding off, and the runtime's socket
 # travels as a forwarded connection.

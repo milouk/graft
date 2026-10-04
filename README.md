@@ -7,8 +7,8 @@ no hypervisor for the hardware. Its first target is macOS on AMD processors,
 where it makes Docker work.
 
 ```sh
-nvmm-docker start
-nvmm-docker nerdctl run --rm alpine uname -a
+graft start
+graft nerdctl run --rm alpine uname -a
 ```
 
 ## The problem
@@ -135,8 +135,8 @@ stages of rising risk.
 
 ```sh
 ./tools/build-qemu.sh       # QEMU is used to build the image, not to run it
-ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.nvmm-docker
-cp <vmlinuz-virt> ~/.nvmm-docker/
+ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.graft
+cp <vmlinuz-virt> ~/.graft/
 ```
 
 The ISO is Alpine's "virt" image and `vmlinuz-virt` the kernel from the
@@ -148,13 +148,13 @@ With [gvproxy](https://github.com/containers/gvisor-tap-vsock/releases) on
 the PATH:
 
 ```sh
-vmm/nvmm-docker start
-vmm/nvmm-docker nerdctl run --rm -p 8080:80 nginx:alpine   # then: curl 127.0.0.1:8080
-vmm/nvmm-docker ssh                                        # a shell in the VM
-vmm/nvmm-docker stop
+vmm/graft start
+vmm/graft nerdctl run --rm -p 8080:80 nginx:alpine   # then: curl 127.0.0.1:8080
+vmm/graft ssh                                        # a shell in the VM
+vmm/graft stop
 ```
 
-`NVMM_DOCKER_CPUS` and `NVMM_DOCKER_MEM` size the VM.
+`GRAFT_CPUS` and `GRAFT_MEM` size the VM.
 
 ## Container runtimes
 
@@ -164,17 +164,17 @@ adding a file.
 
 | Flavor | In the VM | Used from the Mac as | Docker API |
 | --- | --- | --- | --- |
-| `containerd` (default) | containerd, nerdctl, crun | `nvmm-docker nerdctl …` | no |
+| `containerd` (default) | containerd, nerdctl, crun | `graft nerdctl …` | no |
 | `docker` | the Docker daemon | a `docker` client, through a socket | yes |
-| `podman` | Podman and its API service | a `docker` or `podman` client, or `nvmm-docker podman …` | yes |
+| `podman` | Podman and its API service | a `docker` or `podman` client, or `graft podman …` | yes |
 
 `containerd` is the smallest and lightest. Choose `docker` or `podman` when
 something needs `docker.sock`: Compose, dev containers, test frameworks.
 
 ```sh
-FLAVOR=docker ACCEL=nvmm vmm/build-image.exp <qemu> <iso> ~/.nvmm-docker
-vmm/nvmm-docker start
-export DOCKER_HOST=unix://$HOME/.nvmm-docker/docker.sock
+FLAVOR=docker ACCEL=nvmm vmm/build-image.exp <qemu> <iso> ~/.graft
+vmm/graft start
+export DOCKER_HOST=unix://$HOME/.graft/docker.sock
 docker run --rm alpine uname -a
 ```
 
@@ -321,7 +321,7 @@ src/        the working copy of those sources, with NVMM_PORT hooks
 port/       the portable layer: guest memory, page tables, locks
 darwin/     the macOS kernel extension
 lib/        libnvmm
-vmm/        nvmm-run, nvmm-docker, runtime flavors, image build
+vmm/        nvmm-run, graft, runtime flavors, image build
 test/       unit, bare-metal, mutation, image and on-hardware tests
 tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
 ```
