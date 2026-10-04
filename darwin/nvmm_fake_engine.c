@@ -19,6 +19,15 @@
 struct fake_cpudata {
 	struct nvmm_x64_state state;
 	uint64_t runs;
+	uint64_t events;	/* injections the emulator committed */
+};
+
+/* The same configuration slots, with the same sizes, as the real engine. */
+static const size_t fake_vcpu_conf_sizes[NVMM_X86_VCPU_NCONF] = {
+	[NVMM_VCPU_CONF_MD(NVMM_VCPU_CONF_CPUID)] =
+	    sizeof(struct nvmm_vcpu_conf_cpuid),
+	[NVMM_VCPU_CONF_MD(NVMM_VCPU_CONF_TPR)] =
+	    sizeof(struct nvmm_vcpu_conf_tpr)
 };
 
 static bool
@@ -41,10 +50,10 @@ static void
 fake_capability(struct nvmm_capability *cap)
 {
 	cap->arch.mach_conf_support = 0;
-	cap->arch.vcpu_conf_support = 0;
+	cap->arch.vcpu_conf_support = NVMM_CAP_ARCH_VCPU_CONF_CPUID;
 	cap->arch.xcr0_mask = 0;
 	cap->arch.mxcsr_mask = x86_fpu_mxcsr_mask;
-	cap->arch.conf_cpuid_maxops = 0;
+	cap->arch.conf_cpuid_maxops = 8;
 }
 
 static void
@@ -86,10 +95,20 @@ fake_vcpu_destroy(struct nvmm_machine *mach __unused, struct nvmm_cpu *vcpu)
 }
 
 static int
-fake_vcpu_configure(struct nvmm_cpu *vcpu __unused, uint64_t op __unused,
+fake_vcpu_configure(struct nvmm_cpu *vcpu __unused, uint64_t op,
     void *data __unused)
 {
-	return EINVAL;
+	/*
+	 * Accept what an emulator configures at start-up, so that it can get
+	 * as far as running a vCPU. There is no CPU to apply it to.
+	 */
+	switch (op) {
+	case NVMM_VCPU_CONF_MD(NVMM_VCPU_CONF_CPUID):
+	case NVMM_VCPU_CONF_MD(NVMM_VCPU_CONF_TPR):
+		return 0;
+	default:
+		return EINVAL;
+	}
 }
 
 #define FAKE_COPY(flag, field)						\
@@ -152,6 +171,12 @@ fake_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 	fake_vcpu_setstate(vcpu);
 	comm->state_cached = 0;
 
+	/* Acknowledge an injected event, as the real engine does. */
+	if (comm->event_commit) {
+		comm->event_commit = false;
+		cpudata->events++;
+	}
+
 	/* The real loop runs with preemption off; keep that path honest. */
 	os_preempt_disable();
 	hcpu = (int)os_curcpu_number();
@@ -193,6 +218,15 @@ fake_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		exit->reason = NVMM_VCPU_EXIT_HALTED;
 		break;
 
+	case 0:
+		/*
+		 * No command: a vCPU fresh out of reset, as an emulator starts
+		 * it. Behave like a guest that halts at once and stays halted,
+		 * so the emulator idles instead of failing.
+		 */
+		exit->reason = NVMM_VCPU_EXIT_HALTED;
+		break;
+
 	default:
 		exit->reason = NVMM_VCPU_EXIT_INVALID;
 		exit->u.inv.hwcode = gprs[NVMM_X64_GPR_RAX];
@@ -216,8 +250,8 @@ const struct nvmm_impl nvmm_x86_fake = {
 	.capability = fake_capability,
 	.mach_conf_max = 0,
 	.mach_conf_sizes = NULL,
-	.vcpu_conf_max = 0,
-	.vcpu_conf_sizes = NULL,
+	.vcpu_conf_max = NVMM_X86_VCPU_NCONF,
+	.vcpu_conf_sizes = fake_vcpu_conf_sizes,
 	.state_size = sizeof(struct nvmm_x64_state),
 	.machine_create = fake_machine_create,
 	.machine_destroy = fake_machine_destroy,

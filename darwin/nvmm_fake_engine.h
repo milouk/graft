@@ -8,6 +8,8 @@
 #ifndef _NVMM_FAKE_ENGINE_H_
 #define _NVMM_FAKE_ENGINE_H_
 
+/* 0 (the value RAX has after reset) halts without advancing. */
+
 /* Exit with an I/O port write to the port in RBX. */
 #define NVMM_FAKE_CMD_IO	1
 /*
