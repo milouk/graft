@@ -4,6 +4,7 @@
 #   make bare        compile the bare-metal test kernel (objects only)
 #   make test-bare   link it and run it under QEMU with emulated AMD-V (Docker)
 #   make kext        compile and link the macOS kernel extension (x86_64)
+#   make release     the kext without debug symbols, for installing
 #   make libnvmm     the userland library and its headers, for macOS x86_64
 #   make selftest    the self-test kext (stand-in engine) and its test programs
 #   make check       unit, test-bare and kext
@@ -19,7 +20,7 @@ COMMON_INC	:= -Iport -Iport/compat -Isrc
 WARN		:= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 		   -Wno-missing-field-initializers
 
-.PHONY: all check unit bare test-bare kext selftest libnvmm clean
+.PHONY: all check unit bare test-bare kext release selftest libnvmm clean
 all: check
 check: unit test-bare kext
 
@@ -110,6 +111,16 @@ $(KEXT_BUNDLE)/Contents/MacOS/NVMM: $(KEXT_OBJS) darwin/Info.plist
 	    -mmacosx-version-min=10.15 -isysroot $(SDK) \
 	    -o $@ $(KEXT_OBJS) -lkmod -lkmodc++ -lcc_kext
 	cp darwin/Info.plist $(KEXT_BUNDLE)/Contents/Info.plist
+
+# A copy without debug symbols, for installing. Keep the unstripped one while
+# debugging: its symbols are what make a panic log readable.
+RELEASE_BUNDLE	:= $(BUILD)/release/NVMM.kext
+
+release: $(KEXT_BUNDLE)/Contents/MacOS/NVMM
+	@rm -rf $(RELEASE_BUNDLE) && mkdir -p $(RELEASE_BUNDLE)/Contents/MacOS
+	strip -S -x -o $(RELEASE_BUNDLE)/Contents/MacOS/NVMM $(KEXT_BUNDLE)/Contents/MacOS/NVMM
+	cp darwin/Info.plist $(RELEASE_BUNDLE)/Contents/Info.plist
+	@ls -l $(RELEASE_BUNDLE)/Contents/MacOS/NVMM | awk '{printf "built $(RELEASE_BUNDLE) (%.0f KB)\n", $$5/1024}'
 
 # ----------------------------------------------- glue self-test (any Intel Mac)
 # The same kext without the engine's CPU check, plus a device that exercises

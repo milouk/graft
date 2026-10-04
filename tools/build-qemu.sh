@@ -91,6 +91,7 @@ cd "$SRC/build"
     --ninja="$DEPS/venv/bin/ninja" \
     --target-list=x86_64-softmmu \
     --enable-nvmm \
+    --enable-slirp \
     --disable-pixman \
     --disable-gcrypt \
     --disable-gnutls \
@@ -105,7 +106,7 @@ cd "$SRC/build"
 	echo "ERROR: configure failed; full log in $SRC/build/configure.log" >&2
 	exit 1
 }
-grep -E "NVMM support|HVF support|TCG support" configure.log | sed 's/^/    /'
+grep -E "NVMM support|TCG support|slirp support|vmnet" configure.log | sed 's/^ */    /'
 grep -q "NVMM support *: YES" configure.log || {
 	echo "ERROR: QEMU configured without NVMM; see $SRC/build/configure.log" >&2
 	exit 1

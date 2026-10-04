@@ -3,10 +3,10 @@
 # bootstrap-deps.sh — get what QEMU needs to build, without a package manager.
 #
 # QEMU's build needs Python 3.9 or newer (macOS ships one with the command
-# line tools), ninja, pkg-config and glib. Homebrew no longer installs on
+# line tools), ninja, pkg-config, glib and libslirp. Homebrew no longer installs on
 # x86_64 Macs, and MacPorts compiles some eighty packages from source to
-# provide these four. So: ninja, meson and pkg-config come as ready-made
-# Python wheels, and glib is built from source, which takes a few minutes.
+# provide them. So: ninja, meson and pkg-config come as ready-made Python
+# wheels, and glib and libslirp are built from source, in a few minutes.
 #
 # Everything lands under <build dir>/deps; nothing is installed system-wide.
 #
@@ -17,6 +17,7 @@ set -eu
 
 GLIB_SERIES=2.88
 GLIB_VERSION=2.88.3
+SLIRP_VERSION=4.9.5
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD=${NVMM_BUILD_DIR:-"$ROOT/build"}
@@ -104,8 +105,42 @@ PC
 	}
 fi
 
+# libslirp is QEMU's user-mode network stack: a guest gets outbound network
+# access with no privileges and no host configuration. QEMU stopped bundling
+# it, so without this a VM has no network unless it is run as root with vmnet.
+if [ ! -f "$PREFIX/lib/pkgconfig/slirp.pc" ]; then
+	TARBALL="$DEPS/libslirp-$SLIRP_VERSION.tar.gz"
+	if [ ! -f "$TARBALL" ]; then
+		echo "==> downloading libslirp $SLIRP_VERSION"
+		curl -fsSL --retry 3 -o "$TARBALL.part" \
+		    "https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v$SLIRP_VERSION/libslirp-v$SLIRP_VERSION.tar.gz"
+		mv "$TARBALL.part" "$TARBALL"
+	fi
+	rm -rf "$DEPS/libslirp-v$SLIRP_VERSION"
+	tar -xf "$TARBALL" -C "$DEPS"
+
+	echo "==> building libslirp"
+	cd "$DEPS/libslirp-v$SLIRP_VERSION"
+	PATH="$VENV/bin:$PATH" PKG_CONFIG="$VENV/bin/pkg-config-real" \
+	PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+	    "$VENV/bin/meson" setup _build \
+	    --prefix="$PREFIX" --libdir=lib --buildtype=release \
+	    > "$DEPS/slirp-setup.log" 2>&1 || {
+		tail -25 "$DEPS/slirp-setup.log" >&2
+		echo "ERROR: libslirp configure failed; see $DEPS/slirp-setup.log" >&2
+		exit 1
+	}
+	PATH="$VENV/bin:$PATH" "$VENV/bin/ninja" -C _build install \
+	    > "$DEPS/slirp-build.log" 2>&1 || {
+		grep -E "error:|FAILED" "$DEPS/slirp-build.log" | head -20 >&2
+		echo "ERROR: libslirp build failed; see $DEPS/slirp-build.log" >&2
+		exit 1
+	}
+fi
+
 echo "==> ready"
 echo "    ninja       $("$VENV/bin/ninja" --version)"
 echo "    meson       $("$VENV/bin/meson" --version)"
 echo "    pkg-config  $("$VENV/bin/pkg-config-real" --version)"
 echo "    glib        $(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$VENV/bin/pkg-config-real" --modversion glib-2.0)"
+echo "    libslirp    $(PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$VENV/bin/pkg-config-real" --modversion slirp)"
