@@ -58,6 +58,10 @@ if {![file exists $sock]} {
 set timeout 180
 spawn nc -U $sock
 
+# The shell's prompt. It is sometimes followed at once by a cursor-position
+# query (ESC [ 6 n), which nothing here answers.
+set prompt {localhost:~# (\x1b\[6n)?$}
+
 # What QEMU said, and whether it is still running.
 proc qemu_status {} {
     global qpid qerr
@@ -69,10 +73,11 @@ proc qemu_status {} {
 }
 
 proc run {cmd {t 180}} {
+    global prompt
     set timeout $t
     send -- "$cmd\r"
     expect {
-        -re {localhost:~# $} {}
+        -re $prompt {}
         timeout { puts "\n### TIMEOUT waiting after: $cmd ([qemu_status])"; exit 1 }
         eof { puts "\n### CONSOLE CLOSED during: $cmd ([qemu_status])"; exit 1 }
     }
@@ -84,7 +89,7 @@ expect {
     eof { puts "\n### CONSOLE CLOSED before login ([qemu_status])"; exit 1 }
 }
 send "root\r"
-expect -re {localhost:~# $}
+expect -re $prompt
 
 run {uname -a; nproc; free -m | head -2; date}
 # OpenRC will not start Docker unless its "networking" service is up, and
