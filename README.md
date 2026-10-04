@@ -23,8 +23,8 @@ before trusting any of it.
 | World-switch assembly (host VMCB variant) | Exercised by the engine tests; host state checked after every guest run |
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported on macOS 15 and 10.15 |
 | Engine and glue together, on an AMD CPU | **Never run** |
-| `libnvmm` for macOS | Not started |
-| QEMU with `-accel nvmm` on macOS | Not started |
+| `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
+| QEMU with `-accel nvmm` on macOS | Builds (`tools/build-qemu.sh`) and starts a machine through the driver on real Sequoia, with the stand-in engine. **Has never run guest code** |
 
 What the tests cannot show, because the emulator hides it:
 
@@ -65,7 +65,9 @@ make unit         # page table builder, with sanitizers
 make test-bare    # link the test kernel and boot it under emulated AMD-V
 make kext         # build/NVMM.kext, x86_64
 make check        # all three
-make selftest     # the glue self-test kext and its driver program
+make libnvmm      # the userland library and headers
+make selftest     # the self-test kext (stand-in engine) and its test programs
+./tools/build-qemu.sh   # QEMU with the nvmm accelerator; run on an x86_64 Mac
 ./tools/check-kpi.sh          # every symbol the kext imports is exported
 ./test/mutation/mutate.py     # each deliberate bug is caught (slow)
 ```
@@ -127,6 +129,34 @@ Running it on a real machine found two bugs that emulation could not:
 On macOS 11 and later a kext has to be approved in System Settings and the
 machine restarted before it will load, and again each time the binary changes.
 
+## libnvmm and QEMU
+
+`lib/` is libnvmm from DragonFly BSD. One thing differs on macOS: the kernel
+owns the process's mapping of the comm page, so `NVMM_IOC_VCPU_DESTROY`
+removes it and the library does not `munmap()` it.
+
+QEMU has carried an `nvmm` accelerator since 6.0, written against libnvmm,
+but its build only looks for it on NetBSD. `tools/build-qemu.sh` widens that
+one check and builds QEMU against this repository's library. It needs only
+the Xcode command line tools: `tools/bootstrap-deps.sh` fetches meson, ninja
+and pkg-config as Python wheels and builds glib from source, because Homebrew
+no longer installs on x86_64 Macs and MacPorts compiles about eighty packages
+to provide the same four things.
+
+To test all of this without AMD-V, the self-test kext puts a stand-in engine
+(`darwin/nvmm_fake_engine.c`) behind `/dev/nvmm`. It runs no guest code: it
+obeys a command in RAX, and treats a vCPU fresh out of reset as a guest that
+halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
+
+- `nvmm-fake-test` (libnvmm: machines, vCPUs, state through the comm page,
+  guest RAM over an existing mapping, the guest-physical map, error paths, a
+  child that exits without tidying up) passes 314 checks, repeatedly, with no
+  growth in IOKit object counts.
+- `qemu-system-x86_64 -accel nvmm -m 1G` starts, reports "NetBSD Virtual
+  Machine Monitor accelerator is operational" and `VM status: running`, shows
+  the vCPU in its reset state as read back through the driver, and quits
+  cleanly; the driver passes its tests afterwards.
+
 ## First load on real hardware
 
 The self-test kext has been through this on an Intel Mac. The real kext, with
@@ -153,7 +183,8 @@ The first thing to exercise after that is a userland port of the checks in
 
 ## Known gaps
 
-- `libnvmm` and the QEMU build are not done, so nothing can use the driver yet.
+- Nothing has run guest code outside the emulator tests. The first real
+  guest needs an AMD machine.
 - Sleep and wake: the notifications arrive and the glue survives a cycle on
   real hardware, and the engine's suspend path is tested under emulation, but
   the two have not been tested together, and never with a guest running.
