@@ -60,6 +60,10 @@ struct nvmm_cpu {
 
 	/* Comm page. */
 	struct nvmm_comm_page *comm;
+#if defined(NVMM_PORT)
+	/* Where the comm page is mapped in the owning process. */
+	vaddr_t comm_uva;
+#endif
 
 	/* Last host CPU on which the VCPU ran. */
 	int hcpu_last;
@@ -131,6 +135,9 @@ struct nvmm_impl {
 
 #if defined(__x86_64__)
 extern const struct nvmm_impl nvmm_x86_svm;
+#if defined(NVMM_FAKE_ENGINE)
+extern const struct nvmm_impl nvmm_x86_fake;
+#endif
 extern const struct nvmm_impl nvmm_x86_vmx;
 #endif
 

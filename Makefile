@@ -4,7 +4,8 @@
 #   make bare        compile the bare-metal test kernel (objects only)
 #   make test-bare   link it and run it under QEMU with emulated AMD-V (Docker)
 #   make kext        compile and link the macOS kernel extension (x86_64)
-#   make selftest    the glue self-test kext and its driver program
+#   make libnvmm     the userland library and its headers, for macOS x86_64
+#   make selftest    the self-test kext (stand-in engine) and its test programs
 #   make check       unit, test-bare and kext
 #   make clean
 
@@ -18,7 +19,7 @@ COMMON_INC	:= -Iport -Iport/compat -Isrc
 WARN		:= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 		   -Wno-missing-field-initializers
 
-.PHONY: all check unit bare test-bare kext selftest clean
+.PHONY: all check unit bare test-bare kext selftest libnvmm clean
 all: check
 check: unit test-bare kext
 
@@ -116,23 +117,26 @@ $(KEXT_BUNDLE)/Contents/MacOS/NVMM: $(KEXT_OBJS) darwin/Info.plist
 ST_DIR		:= $(BUILD)/kext-selftest
 ST_BUNDLE	:= $(BUILD)/NVMMSelfTest.kext
 ST_OBJS		:= $(patsubst $(KEXT_DIR)/%,$(ST_DIR)/%,$(KEXT_OBJS)) \
-		   $(ST_DIR)/nvmm_darwin_selftest.o
+		   $(ST_DIR)/nvmm_darwin_selftest.o \
+		   $(ST_DIR)/nvmm_fake_engine.o
 ST_TOOL		:= $(BUILD)/nvmm-selftest
+ST_FLAGS	:= -DNVMM_DARWIN_SELFTEST -DNVMM_FAKE_ENGINE
+FAKE_TOOL	:= $(BUILD)/nvmm-fake-test
 
-selftest: $(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest $(ST_TOOL)
-	@echo "built $(ST_BUNDLE) and $(ST_TOOL)"
+selftest: $(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest $(ST_TOOL) $(FAKE_TOOL)
+	@echo "built $(ST_BUNDLE), $(ST_TOOL) and $(FAKE_TOOL)"
 
 $(ST_DIR)/%.o: %.c
 	@mkdir -p $(ST_DIR)
-	$(CC) $(KEXT_CFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+	$(CC) $(KEXT_CFLAGS) $(ST_FLAGS) -MMD -MP -c $< -o $@
 
 $(ST_DIR)/%.o: %.S
 	@mkdir -p $(ST_DIR)
-	$(CC) $(KEXT_CFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+	$(CC) $(KEXT_CFLAGS) $(ST_FLAGS) -MMD -MP -c $< -o $@
 
 $(ST_DIR)/%.o: %.cpp
 	@mkdir -p $(ST_DIR)
-	clang++ $(KEXT_CXXFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+	clang++ $(KEXT_CXXFLAGS) $(ST_FLAGS) -MMD -MP -c $< -o $@
 
 -include $(ST_OBJS:.o=.d)
 
@@ -149,6 +153,38 @@ $(ST_TOOL): test/darwin/selftest.c darwin/nvmm_selftest_ioctl.h
 	@mkdir -p $(BUILD)
 	$(CC) -arch x86_64 -mmacosx-version-min=10.15 -O2 -Wall -Wextra -Werror \
 	    -Idarwin -o $@ test/darwin/selftest.c
+
+# ------------------------------------------------------------ libnvmm (macOS)
+# The userland library, and the kernel ABI headers it is built against, laid
+# out the way an emulator expects to find them: <nvmm.h> on the include path.
+INC_DIR		:= $(BUILD)/include
+LIBNVMM		:= $(BUILD)/libnvmm.a
+USER_CFLAGS	:= -arch x86_64 -mmacosx-version-min=10.15 -O2 -Wall -Wextra \
+		   -Wno-unused-parameter -Wno-sign-compare -Werror \
+		   -I$(INC_DIR)
+LIB_HEADERS	:= $(INC_DIR)/nvmm.h $(INC_DIR)/dev/nvmm/nvmm.h \
+		   $(INC_DIR)/dev/nvmm/nvmm_ioctl.h \
+		   $(INC_DIR)/dev/nvmm/x86/nvmm_x86.h $(INC_DIR)/sys/bitops.h
+
+libnvmm: $(LIBNVMM)
+	@echo "built $(LIBNVMM), headers in $(INC_DIR)"
+
+$(INC_DIR)/nvmm.h: lib/nvmm.h
+	@mkdir -p $(dir $@) && cp $< $@
+$(INC_DIR)/dev/nvmm/%.h: src/%.h
+	@mkdir -p $(dir $@) && cp $< $@
+$(INC_DIR)/dev/nvmm/x86/%.h: src/x86/%.h
+	@mkdir -p $(dir $@) && cp $< $@
+$(INC_DIR)/sys/bitops.h: port/compat/sys/bitops.h
+	@mkdir -p $(dir $@) && cp $< $@
+
+$(LIBNVMM): lib/libnvmm.c lib/libnvmm_x86.c lib/libnvmm_darwin.h $(LIB_HEADERS)
+	$(CC) $(USER_CFLAGS) -Ilib -c lib/libnvmm.c -o $(BUILD)/libnvmm.o
+	rm -f $@ && ar rcs $@ $(BUILD)/libnvmm.o
+
+$(FAKE_TOOL): test/darwin/nvmm-fake-test.c darwin/nvmm_fake_engine.h $(LIBNVMM)
+	@mkdir -p $(BUILD)
+	$(CC) $(USER_CFLAGS) -Idarwin -o $@ test/darwin/nvmm-fake-test.c $(LIBNVMM)
 
 clean:
 	rm -rf $(BUILD)

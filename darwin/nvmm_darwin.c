@@ -511,27 +511,6 @@ nvmm_kext_start(kmod_info_t *ki __unused, void *data __unused)
 	nvmm_darwin_mem_init();
 	port_init();
 
-#if defined(NVMM_DARWIN_SELFTEST)
-	/*
-	 * Glue self-test build: no CPU check and no engine, so this loads on
-	 * any x86_64 Mac. See nvmm_darwin_selftest.c.
-	 */
-	error = port_x86_init();
-	if (error != 0) {
-		printf("nvmm: cannot set up FPU state storage (%d)\n", error);
-		goto fail_port;
-	}
-	error = nvmm_selftest_attach();
-	if (error != 0) {
-		printf("nvmm: cannot create the self-test device (%d)\n",
-		    error);
-		goto fail_x86;
-	}
-	nvmm_darwin_power_register();
-	printf("nvmm: self-test build attached; the engine is not started\n");
-	return KERN_SUCCESS;
-#endif
-
 	if (nvmm_ident() == NULL) {
 		printf("nvmm: this CPU is not supported (AMD with SVM, nested "
 		    "paging and next-RIP save is required)\n");
@@ -562,6 +541,21 @@ nvmm_kext_start(kmod_info_t *ki __unused, void *data __unused)
 		goto fail_cdev;
 	}
 
+#if defined(NVMM_DARWIN_SELFTEST)
+	/*
+	 * Self-test build: the stand-in engine is behind /dev/nvmm, and the
+	 * glue checks are behind /dev/nvmm-selftest.
+	 */
+	error = nvmm_selftest_attach();
+	if (error != 0) {
+		printf("nvmm: cannot create the self-test device (%d)\n",
+		    error);
+		devfs_remove(nvmm_devnode);
+		nvmm_devnode = NULL;
+		goto fail_cdev;
+	}
+#endif
+
 	nvmm_darwin_power_register();
 
 	printf("nvmm: attached, using backend %s\n", nvmm_impl->name);
@@ -586,24 +580,16 @@ nvmm_kext_stop(kmod_info_t *ki __unused, void *data __unused)
 {
 	int i;
 
-#if defined(NVMM_DARWIN_SELFTEST)
-	if (nvmm_selftest_detach() != 0)
-		return KERN_FAILURE;
-	nvmm_darwin_power_unregister();
-	port_x86_fini();
-	port_fini();
-	nvmm_darwin_mem_fini();
-	darwin_locks_fini();
-	printf("nvmm: self-test build detached\n");
-	return KERN_SUCCESS;
-#endif
-
 	if (os_atomic_load_uint(&nvmm_nmachines) > 0)
 		return KERN_FAILURE;
 	for (i = 0; i < NVMM_MAXOPEN; i++) {
 		if (nvmm_owners[i] != NULL)
 			return KERN_FAILURE;
 	}
+#if defined(NVMM_DARWIN_SELFTEST)
+	if (nvmm_selftest_detach() != 0)
+		return KERN_FAILURE;
+#endif
 
 	nvmm_darwin_power_unregister();
 

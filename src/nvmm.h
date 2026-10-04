@@ -29,6 +29,11 @@
 #ifndef _NVMM_H_
 #define _NVMM_H_
 
+#if defined(__APPLE__) && !defined(NVMM_PORT)
+/* macOS has one OS layer, in the kernel and in userland alike. */
+#define NVMM_PORT	1
+#endif
+
 #include <sys/cdefs.h>
 #include <sys/types.h>
 

@@ -34,7 +34,10 @@ static struct nvmm_machine machines[NVMM_MAX_MACHINES];
 volatile unsigned int nvmm_nmachines __cacheline_aligned;
 
 static const struct nvmm_impl *nvmm_impl_list[] = {
-#if defined(__x86_64__)
+#if defined(NVMM_FAKE_ENGINE)
+	/* Self-test builds: no hardware, no guest code. See darwin/. */
+	&nvmm_x86_fake
+#elif defined(__x86_64__)
 	&nvmm_x86_svm,	/* x86 AMD SVM */
 #if !defined(NVMM_PORT)
 	&nvmm_x86_vmx	/* x86 Intel VMX */
@@ -368,9 +371,17 @@ nvmm_vcpu_create(struct nvmm_owner *owner, struct nvmm_ioc_vcpu_create *args)
 		nvmm_vcpu_put(vcpu);
 		goto out;
 	}
+#if defined(NVMM_PORT)
+	vcpu->comm_uva = (vaddr_t)args->comm;
+#endif
 
 	error = (*nvmm_impl->vcpu_create)(mach, vcpu);
 	if (error) {
+#if defined(NVMM_PORT)
+		os_vmobj_unmap(os_curproc_map, vcpu->comm_uva,
+		    vcpu->comm_uva + NVMM_COMM_PAGE_SIZE, false);
+		vcpu->comm_uva = 0;
+#endif
 		nvmm_vcpu_free(mach, vcpu);
 		nvmm_vcpu_put(vcpu);
 		goto out;
@@ -400,6 +411,19 @@ nvmm_vcpu_destroy(struct nvmm_owner *owner, struct nvmm_ioc_vcpu_destroy *args)
 		goto out;
 
 	(*nvmm_impl->vcpu_destroy)(mach, vcpu);
+#if defined(NVMM_PORT)
+	/*
+	 * This runs in the owning process, so its side of the comm page can be
+	 * removed here; the process must not unmap it itself. If the process
+	 * goes away without destroying its vCPUs, closing the device sweeps
+	 * up what is left.
+	 */
+	if (vcpu->comm_uva != 0) {
+		os_vmobj_unmap(os_curproc_map, vcpu->comm_uva,
+		    vcpu->comm_uva + NVMM_COMM_PAGE_SIZE, false);
+		vcpu->comm_uva = 0;
+	}
+#endif
 	nvmm_vcpu_free(mach, vcpu);
 	nvmm_vcpu_put(vcpu);
 	os_atomic_dec_uint(&mach->ncpus);
