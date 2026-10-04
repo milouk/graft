@@ -1,4 +1,4 @@
-nvmm-darwin is offered under the two-clause BSD licence below.
+Graft is offered under the two-clause BSD licence below.
 
 The files under upstream/, src/ and lib/ come from DragonFly BSD and NetBSD
 and carry their own copyright notices, which remain in force:
