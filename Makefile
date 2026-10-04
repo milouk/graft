@@ -1,4 +1,4 @@
-# nvmm-darwin
+# Graft
 #
 #   make unit        userspace tests for the nested page table builder
 #   make bare        compile the bare-metal test kernel (objects only)
