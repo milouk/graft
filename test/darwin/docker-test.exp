@@ -16,6 +16,12 @@ if {$argc != 3} {
 }
 lassign $argv qemu iso disk
 
+# Treat the console as bytes. apk and docker draw progress bars with
+# multi-byte characters, and when one of those arrives split across two
+# reads, Tcl's UTF-8 decoding fails the read; Expect takes that for the end
+# of the console and closes it.
+encoding system iso8859-1
+
 set smp 1
 if {[info exists env(SMP)]} { set smp $env(SMP) }
 
@@ -87,14 +93,14 @@ run {printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\
 run {rc-service networking start; ip -4 addr show eth0 | grep inet} 90
 run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/main > /etc/apk/repositories}
 run {echo https://dl-cdn.alpinelinux.org/alpine/v3.24/community >> /etc/apk/repositories}
-run {apk update} 120
-run {apk add e2fsprogs docker} 900
-run {mkfs.ext4 -q -F /dev/vda && mkdir -p /var/lib/docker && mount /dev/vda /var/lib/docker && df -h /var/lib/docker | tail -1} 120
+run {apk --no-progress update} 120
+run {apk --no-progress add e2fsprogs docker} 900
+run {mkfs.ext4 -q -F /dev/vda && modprobe ext4 && mkdir -p /var/lib/docker && mount -t ext4 /dev/vda /var/lib/docker && df -h /var/lib/docker | tail -1} 120
 run {rc-service cgroups start; rc-service docker start} 120
 run {for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker version | grep -E "^(Client|Server)| Version"} 120
 run {docker ps -a} 60
-run {docker run --rm hello-world} 900
-run {docker run --rm alpine sh -c "echo hello from a container on \$(uname -m), kernel \$(uname -r)"} 900
+run {docker run -q --rm hello-world} 900
+run {docker run -q --rm alpine sh -c "echo hello from a container on \$(uname -m), kernel \$(uname -r)"} 900
 run {docker ps -a} 60
 run {echo NVMM-DOCKER-TEST-DONE}
 send "poweroff\r"
