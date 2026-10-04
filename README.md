@@ -171,8 +171,9 @@ Catalina.
 | macOS Sequoia | Symbols check out; the engine has **never run there** |
 
 In short runs, CPU-bound work scales across vCPUs, disk and network speeds
-are unremarkable, and an idle VM costs the host little but not nothing.
-There are no long-run results.
+are unremarkable, and an idle VM costs the host little but not nothing. A
+few minutes of sustained load on several vCPUs run clean; there are no
+results longer than that.
 
 One binary is meant to serve every macOS from the minimum in
 `darwin/Info.plist` onwards: the kext imports only exported kernel symbols,
@@ -260,6 +261,20 @@ docker run --rm -p 8080:80 nginx:alpine     # then: curl http://127.0.0.1:8080
 vmm/nvmm-docker ssh                         # a shell in the VM
 vmm/nvmm-docker stop
 ```
+
+To leave Docker out altogether, build the image with `FLAVOR=containerd`.
+It then holds containerd and nerdctl and nothing of Docker's: smaller on
+disk and lighter in memory, at the price of the Docker API. Nothing that
+expects `docker.sock` works with it; containers are run with nerdctl, which
+takes docker's command line, inside the VM:
+
+```sh
+vmm/nvmm-docker nerdctl run --rm alpine uname -a
+vmm/nvmm-docker nerdctl compose up
+```
+
+The default image has the Docker daemon and not its client, which stays on
+the Mac.
 
 `NVMM_DOCKER_CPUS` and `NVMM_DOCKER_MEM` size the VM; the defaults are at
 the top of the script. The Docker socket is readable only by its owner; gvproxy carries
