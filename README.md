@@ -29,6 +29,7 @@ before trusting any of it.
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
 | Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
+| `nvmm-run`, a small VMM of our own (`vmm/`) | Boots Alpine Linux from a disk image and runs Docker containers in it on the same Ryzen, with no QEMU involved: one vCPU, serial console, virtio disk. Its network card (vmnet) compiles and has not been run |
 | QEMU with `-accel nvmm` on macOS | QEMU 7.2.22 on macOS 10.15.5 boots Linux and runs Docker through the driver, one vCPU. QEMU 11 builds and starts a machine on macOS 15 against the stand-in engine, but has not run a guest. More than one vCPU per machine has never been tried |
 
 **macOS versions.** One binary is meant to serve macOS 10.13 (the first with
@@ -64,6 +65,8 @@ test/baremetal  a freestanding kernel that boots in QEMU and drives the engine
 test/mutation   deliberate bugs, to check that the tests can fail
 test/darwin     programs that drive a loaded kext: the glue self-test, libnvmm
                 against the stand-in engine, and the first real guests
+vmm/        nvmm-run, a small VMM that replaces QEMU, and the scripts that
+            build and test its disk image
 lib/        libnvmm
 tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
 ```
@@ -191,6 +194,36 @@ halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
   Machine Monitor accelerator is operational" and `VM status: running`, shows
   the vCPU in its reset state as read back through the driver, and quits
   cleanly; the driver passes its tests afterwards.
+
+## nvmm-run: without QEMU
+
+`vmm/nvmm-run.c` is a virtual machine monitor of about 1,400 lines on
+libnvmm. It loads a Linux kernel directly (no firmware) and gives it a 16550
+serial console, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
+and virtio block and network devices on the memory-mapped transport. The
+kernel is told there is no ACPI, no PCI and no local APIC, which is what
+keeps it small: NVMM leaves every device to userland, and the local APIC is
+by far the largest. The price is a single virtual CPU.
+
+```
+make vmm
+# Build the disk image and initramfs once (uses QEMU as a build tool only):
+ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> out/
+# Run, with the kernel from the same ISO (boot/vmlinuz-virt):
+build/nvmm-run -k vmlinuz-virt -i out/initramfs-nvmm -d out/rootfs.img \
+    -m 2048 -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet"
+```
+
+On the Ryzen 7 2700 under macOS 10.15.5, `vmm/docker-test.exp` boots that
+image to a login in a few seconds, and `docker ps -a`, `docker run
+hello-world` and an Alpine container all work, from images already in the
+disk. What is not there yet:
+
+- The network card (`-n`, macOS vmnet, needs root) has never been run.
+- Disk writes are slow, about 10 MB/s: every request costs a trip through
+  the instruction emulator.
+- One vCPU. More needs a local APIC and I/O APIC.
+- The guest cannot power itself off; it halts, and nvmm-run notices.
 
 ## First load on real hardware
 
