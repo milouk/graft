@@ -194,11 +194,11 @@ $(LIBNVMM): lib/libnvmm.c lib/libnvmm_x86.c lib/libnvmm_darwin.h $(LIB_HEADERS)
 	rm -f $@ && ar rcs $@ $(BUILD)/libnvmm.o
 
 # A small VMM in place of QEMU: boots a Linux kernel directly.
-VMM_TOOL	:= $(BUILD)/nvmm-run
+VMM_TOOL	:= $(BUILD)/graft-run
 vmm: $(VMM_TOOL)
-$(VMM_TOOL): vmm/nvmm-run.c $(LIBNVMM)
+$(VMM_TOOL): vmm/graft-run.c $(LIBNVMM)
 	@mkdir -p $(BUILD)
-	$(CC) $(USER_CFLAGS) -o $@ vmm/nvmm-run.c $(LIBNVMM) -framework vmnet
+	$(CC) $(USER_CFLAGS) -o $@ vmm/graft-run.c $(LIBNVMM) -framework vmnet
 
 # The first real guests. Needs NVMM.kext loaded on an AMD machine.
 GUEST_TOOL	:= $(BUILD)/nvmm-guest-test

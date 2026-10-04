@@ -5,13 +5,13 @@
 # inside the test container, with the repository unpacked in /work and the
 # Alpine ISO and kernel in /dl.
 #
-# This is nvmm-run's image without nvmm-run: QEMU stands in for it, so it
+# This is graft-run's image without graft-run: QEMU stands in for it, so it
 # tests the image and not the hypervisor. It needs no AMD CPU.
 
 set -eu
 FLAVOR=${1:-containerd}
 OUT=/out/$FLAVOR
-KEY="$OUT/id_nvmm"
+KEY="$OUT/id_graft"
 mkdir -p "$OUT"
 
 echo "== build ($FLAVOR)"
@@ -27,7 +27,7 @@ grep -a -o "@@ROOTFS-USED: [0-9]* MB" "$OUT/build.log" | tail -1
 echo "== boot"
 qemu-system-x86_64 -accel tcg -M q35 -m 1G -smp 2 -display none -monitor none \
     -serial "file:$OUT/console.log" -kernel /dl/vmlinuz-virt \
-    -initrd "$OUT/initramfs-nvmm" \
+    -initrd "$OUT/initramfs-graft" \
     -append "console=ttyS0 $(cat "$OUT/cmdline" 2>/dev/null || echo "root=/dev/vda rootfstype=ext4 modules=ext4")" \
     -drive "file=$OUT/rootfs.img,if=virtio,format=raw" \
     $( [ -f "$OUT/data.img" ] && echo "-drive file=$OUT/data.img,if=virtio,format=raw" ) \

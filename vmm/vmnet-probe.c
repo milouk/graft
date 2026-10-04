@@ -1,8 +1,8 @@
 /*
  * vmnet-probe.c — ask macOS's vmnet for an interface in each of its modes
- * and report which ones it will give. nvmm-run's network card sits on vmnet;
+ * and report which ones it will give. graft-run's network card sits on vmnet;
  * when that does not come up, this says whether the trouble is vmnet on this
- * machine or nvmm-run. Needs root.
+ * machine or graft-run. Needs root.
  *
  *   sudo ./vmnet-probe [interface to bridge to, default en0]
  */

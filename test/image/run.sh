@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # run.sh — build an image and try it, without an AMD CPU: in a container,
-# with QEMU's software emulation in place of nvmm-run.
+# with QEMU's software emulation in place of graft-run.
 #
 #   test/image/run.sh [flavor ...]          default: every flavor
 #

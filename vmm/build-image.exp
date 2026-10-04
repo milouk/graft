@@ -1,8 +1,8 @@
 #!/usr/bin/expect -f
 #
-# build-image.exp — make what nvmm-run boots: a root filesystem image
+# build-image.exp — make what graft-run boots: a root filesystem image
 # (Alpine Linux with Docker and two container images), an initramfs that can
-# mount it, and an SSH key (id_nvmm) that the image accepts for root.
+# mount it, and an SSH key (id_graft) that the image accepts for root.
 #
 #   ./build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>
 #
@@ -20,7 +20,7 @@
 # are there without a network; none by default. SIZE sets the
 # size of the root filesystem (default 4G). The Alpine release in
 # guest-build.sh must match the ISO, whose kernel modules the image uses;
-# nvmm-run must then boot that same kernel (the ISO's boot/vmlinuz-virt).
+# graft-run must then boot that same kernel (the ISO's boot/vmlinuz-virt).
 
 if {$argc != 3} {
     puts "usage: build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>"
@@ -42,7 +42,7 @@ if {[info exists env(FLAVOR)]} { set flavor $env(FLAVOR) }
 set outdir [file normalize $outdir]
 set here [file dirname [file normalize [info script]]]
 set rootfs $outdir/rootfs.img
-set initramfs $outdir/initramfs-nvmm
+set initramfs $outdir/initramfs-graft
 set script $outdir/build-script.img
 set scratch $outdir/build-scratch.img
 set sock $outdir/build-serial.sock
@@ -62,7 +62,7 @@ exec $qimg create -f raw $rootfs $size
 exec $qimg create -f raw $scratch 64M
 # A key pair for the host to reach the VM with. Kept if it is already there,
 # so that rebuilding the image does not lock out a running setup's key.
-set key $outdir/id_nvmm
+set key $outdir/id_graft
 if {![file exists $key]} {
     exec ssh-keygen -q -t ed25519 -N "" -C graft -f $key
 }

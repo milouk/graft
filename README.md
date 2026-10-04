@@ -53,7 +53,7 @@ flowchart TB
 | --- | --- |
 | macOS on an AMD CPU | Hardware-accelerated VMs and a container host, where Apple's framework gives nothing |
 | A macOS VM on an AMD server | The same, inside the guest, when the host passes AMD-V through |
-| A BSD that already has NVMM | `nvmm-run`: a machine monitor that boots Linux directly, far smaller than QEMU |
+| A BSD that already has NVMM | `graft-run`: a machine monitor that boots Linux directly, far smaller than QEMU |
 | An x86 kernel with no hypervisor | A port of four primitives instead of a hypervisor written from scratch |
 
 ## What is in it
@@ -63,7 +63,7 @@ flowchart TB
     subgraph user["Userland"]
         cli["docker / nerdctl / podman"]
         gv["gvproxy<br/>network, port and socket forwarding"]
-        subgraph vmm["nvmm-run"]
+        subgraph vmm["graft-run"]
             dev["serial, timers, interrupt controllers,<br/>virtio disk and network"]
             lib["libnvmm"]
         end
@@ -103,7 +103,7 @@ flowchart TB
 | `libnvmm` (`lib/`) | DragonFly BSD | The API emulators are written against |
 | Portable layer (`port/`) | New | Everything NVMM needs from a host, on four primitives |
 | macOS glue (`darwin/`) | New | Those primitives on IOKit and exported kernel interfaces |
-| `nvmm-run` (`vmm/`) | New | Boots Linux directly: no firmware, no PCI, no ACPI |
+| `graft-run` (`vmm/`) | New | Boots Linux directly: no firmware, no PCI, no ACPI |
 
 QEMU works too: it has an `nvmm` accelerator, and `tools/build-qemu.sh`
 builds it against this library.
@@ -191,7 +191,7 @@ where the devices live.
 
 ```mermaid
 sequenceDiagram
-    participant V as vCPU thread (nvmm-run)
+    participant V as vCPU thread (graft-run)
     participant K as NVMM.kext
     participant C as AMD CPU
     participant G as Guest
@@ -228,7 +228,7 @@ flowchart LR
     F --> G["Resume the guest"]
 ```
 
-### The machine nvmm-run provides
+### The machine graft-run provides
 
 A 16550 serial port, the 8259 interrupt controllers, an 8254 timer, a CMOS
 clock, and virtio block and network devices on the memory-mapped transport.
@@ -236,7 +236,7 @@ With more than one CPU, each gets a local APIC and its own thread, and the
 machine an I/O APIC, described by an MP table.
 
 ```sh
-build/nvmm-run -k vmlinuz-virt -i initramfs-nvmm -d rootfs.img -c 4 -m 2048 \
+build/graft-run -k vmlinuz-virt -i initramfs-graft -d rootfs.img -c 4 -m 2048 \
     -n /path/to/gvproxy.sock -a "root=/dev/vda rootfstype=ext4 modules=ext4"
 ```
 
@@ -309,7 +309,7 @@ imported code.
 - Linux guests only, booted directly.
 - No file sharing yet: `-v /a/mac/path:...` has nothing to mount.
 - Published ports are forwarded for TCP only.
-- macOS's vmnet is supported by `nvmm-run -n vmnet` but networking normally
+- macOS's vmnet is supported by `graft-run -n vmnet` but networking normally
   goes through gvproxy, which needs no privileges.
 - `/dev/nvmm` is root-only until its mode is changed.
 
@@ -321,7 +321,7 @@ src/        the working copy of those sources, with NVMM_PORT hooks
 port/       the portable layer: guest memory, page tables, locks
 darwin/     the macOS kernel extension
 lib/        libnvmm
-vmm/        nvmm-run, graft, runtime flavors, image build
+vmm/        graft-run, graft, runtime flavors, image build
 test/       unit, bare-metal, mutation, image and on-hardware tests
 tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
 ```

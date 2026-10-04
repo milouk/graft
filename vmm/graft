@@ -11,9 +11,9 @@
 #   graft <cli> …   the runtime's own command, run in the VM
 #
 # It needs, in $GRAFT_DIR (default ~/.graft), what
-# vmm/build-image.exp makes, plus the kernel: vmlinuz-virt, initramfs-nvmm,
-# rootfs.img, id_nvmm and flavor.env. And on the PATH, or named by $NVMM_RUN
-# and $GVPROXY: nvmm-run and gvproxy. GRAFT_CPUS and GRAFT_MEM
+# vmm/build-image.exp makes, plus the kernel: vmlinuz-virt, initramfs-graft,
+# rootfs.img, id_graft and flavor.env. And on the PATH, or named by $GRAFT_RUN
+# and $GVPROXY: graft-run and gvproxy. GRAFT_CPUS and GRAFT_MEM
 # (megabytes) size the VM; the defaults are one CPU and 2048.
 #
 # What the image runs containers with was chosen when it was built (see
@@ -32,7 +32,7 @@
 set -eu
 
 DIR=${GRAFT_DIR:-"$HOME/.graft"}
-NVMM_RUN=${NVMM_RUN:-nvmm-run}
+GRAFT_RUN=${GRAFT_RUN:-graft-run}
 GVPROXY=${GVPROXY:-gvproxy}
 MEM=${GRAFT_MEM:-2048}
 CPUS=${GRAFT_CPUS:-1}
@@ -53,7 +53,7 @@ ping_docker() {
 	[ "$(curl -s -m 2 --unix-socket "$SOCK" http://docker/_ping 2>/dev/null)" = "OK" ]
 }
 vm_ssh() {
-	ssh -q -i "$DIR/id_nvmm" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
+	ssh -q -i "$DIR/id_graft" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
 	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
 	    root@127.0.0.1 "$@"
 }
@@ -108,7 +108,7 @@ start() {
 		echo "already running (pid $(vm_pid))"
 		return 0
 	fi
-	for f in vmlinuz-virt initramfs-nvmm rootfs.img id_nvmm flavor.env; do
+	for f in vmlinuz-virt initramfs-graft rootfs.img id_graft flavor.env; do
 		[ -f "$DIR/$f" ] || { echo "missing $DIR/$f" >&2; exit 1; }
 	done
 	[ -e /dev/nvmm ] || { echo "/dev/nvmm is not there; is NVMM.kext loaded?" >&2; exit 1; }
@@ -125,7 +125,7 @@ start() {
 		"$GVPROXY" -listen "unix://$CTL" \
 		    -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
 		    -forward-sock "$SOCK" -forward-dest "$FLAVOR_SOCKET" \
-		    -forward-user root -forward-identity "$DIR/id_nvmm" \
+		    -forward-user root -forward-identity "$DIR/id_graft" \
 		    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
 		    > /dev/null 2>&1 &
 	fi
@@ -136,7 +136,7 @@ start() {
 	# The VM's console: what it prints goes to a file, and what it reads
 	# comes from a pipe, which is how "stop" asks it to shut down.
 	mkfifo "$DIR/console.in"
-	"$NVMM_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-nvmm" \
+	"$GRAFT_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-graft" \
 	    -d "$DIR/rootfs.img" -n "$DIR/net.sock" -m "$MEM" -c "$CPUS" \
 	    -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet" \
 	    0<> "$DIR/console.in" > "$DIR/console.log" 2>&1 &

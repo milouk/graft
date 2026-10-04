@@ -1,5 +1,5 @@
 /*
- * nvmm-run.c — a small virtual machine monitor on libnvmm, in place of QEMU.
+ * graft-run.c — a small virtual machine monitor on libnvmm, in place of QEMU.
  *
  * It boots a Linux kernel directly, with no firmware, and gives it the least
  * a kernel needs: a serial console, the legacy interrupt controller, the
@@ -22,7 +22,7 @@
  * DHCP and a route out, with nothing to configure.
  *
  * Usage (needs /dev/nvmm):
- *   nvmm-run -k vmlinuz [-i initramfs] [-d disk.img] [-n vmnet|socket]
+ *   graft-run -k vmlinuz [-i initramfs] [-d disk.img] [-n vmnet|socket]
  *            [-c cpus] [-m megabytes] [-a "extra cmdline"]
  *
  * The console is this terminal. Ctrl-A then x quits.
@@ -121,7 +121,7 @@ die(const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	fprintf(stderr, "\r\nnvmm-run: ");
+	fprintf(stderr, "\r\ngraft-run: ");
 	vfprintf(stderr, fmt, ap);
 	fprintf(stderr, "\r\n");
 	va_end(ap);
@@ -151,7 +151,7 @@ stall_check(uint64_t since, const char *what, unsigned long detail)
 	const uint64_t took = (now > since) ? now - since : 0;
 
 	if (took >= STALL_NS)
-		fprintf(stderr, "\r\n[nvmm-run: %llu ms in %s %#lx]\r\n",
+		fprintf(stderr, "\r\n[graft-run: %llu ms in %s %#lx]\r\n",
 		    (unsigned long long)(took / 1000000), what, detail);
 }
 
@@ -1049,7 +1049,7 @@ blk_worker(void *arg)
 			if ((unsigned int)n - nout == 2 &&
 			    v[nout].iov_len >= 20) {
 				memset(v[nout].iov_base, 0, 20);
-				memcpy(v[nout].iov_base, "nvmm-run", 8);
+				memcpy(v[nout].iov_base, "graft-run", 8);
 				written += 20;
 			}
 			break;
@@ -1326,7 +1326,7 @@ sock_reader(void *arg)
 				break;
 		}
 	}
-	fprintf(stderr, "\r\nnvmm-run: the network helper went away\r\n");
+	fprintf(stderr, "\r\ngraft-run: the network helper went away\r\n");
 	return NULL;
 }
 
@@ -1449,7 +1449,7 @@ static void
 net_add_vmnet(char *cmdline, size_t cmdlen)
 {
 	struct virtio_dev *d = &vdevs[nvdevs];
-	dispatch_queue_t q = dispatch_queue_create("nvmm-run.net", NULL);
+	dispatch_queue_t q = dispatch_queue_create("graft-run.net", NULL);
 	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
 	__block vmnet_return_t status = VMNET_FAILURE;
@@ -1498,7 +1498,7 @@ net_add_vmnet(char *cmdline, size_t cmdlen)
 	net_be.send = vmnet_send;
 	net_be.recv = vmnet_recv;
 	d->max_packet = vmnet_max;
-	fprintf(stderr, "nvmm-run: network up, MAC "
+	fprintf(stderr, "graft-run: network up, MAC "
 	    "%02x:%02x:%02x:%02x:%02x:%02x, largest frame %zu\n", mac[0],
 	    mac[1], mac[2], mac[3], mac[4], mac[5], d->max_packet);
 	net_finish(d, mac, cmdline, cmdlen);
@@ -1925,7 +1925,7 @@ mptable_build(void)
 	memcpy(t, "PCMP", 4);
 	t[6] = 4;					/* spec 1.4 */
 	memcpy(t + 8, "NVMM    ", 8);
-	memcpy(t + 16, "NVMM-RUN    ", 12);
+	memcpy(t + 16, "GRAFT-RUN   ", 12);
 	*(uint32_t *)(void *)(t + 36) = (uint32_t)LAPIC_BASE;
 	e = t + 44;
 
@@ -2531,7 +2531,7 @@ cpu_idle(struct cpu *c)
 		for (i = 0; i < ncpus; i++)
 			stopped += cpus[i].stopped || cpus[i].wait_sipi;
 		if (stopped == ncpus) {
-			fprintf(stderr, "\r\nnvmm-run: the guest halted\r\n");
+			fprintf(stderr, "\r\ngraft-run: the guest halted\r\n");
 			running = false;
 		}
 	}
@@ -2684,7 +2684,7 @@ cpu_thread(void *arg)
 			dump_and_die(c, "the guest triple-faulted");
 			break;
 		default:
-			fprintf(stderr, "\r\nnvmm-run: cpu %u: exit reason "
+			fprintf(stderr, "\r\ngraft-run: cpu %u: exit reason "
 			    "%#llx (hw %#llx)\r\n", c->id,
 			    (unsigned long long)exit->reason,
 			    (unsigned long long)exit->u.inv.hwcode);
@@ -2699,7 +2699,7 @@ cpu_thread(void *arg)
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: nvmm-run -k vmlinuz [-i initramfs] "
+	fprintf(stderr, "usage: graft-run -k vmlinuz [-i initramfs] "
 	    "[-d disk.img] [-n vmnet|socket] [-c cpus]\n"
 	    "                [-m megabytes] [-a \"extra cmdline\"] [-v]\n");
 	exit(2);

@@ -1,5 +1,5 @@
 # guest-build.sh — runs inside the Alpine ISO, as root, to build what
-# nvmm-run boots: a root filesystem on /dev/vda and a matching initramfs,
+# graft-run boots: a root filesystem on /dev/vda and a matching initramfs,
 # written raw to /dev/vdc. build-image.exp hands this file to the guest as
 # the disk /dev/vdb and runs it with "sh /dev/vdb", after putting in front of
 # it the host's public key (PUBKEY), the container images to pull into the
@@ -25,12 +25,12 @@ apk --no-progress add e2fsprogs mkinitfs
 [ -z "${IMAGES:-}" ] || apk --no-progress add $FLAVOR_BUILD_PKGS
 
 step "initramfs with the disk and filesystem drivers, for kernel $KVER"
-mkinitfs -F "base ext4 virtio network" -o /tmp/initramfs-nvmm "$KVER"
-dd if=/tmp/initramfs-nvmm of=/dev/vdc bs=1M 2>/dev/null
-echo "@@INITRAMFS-SIZE:$(stat -c %s /tmp/initramfs-nvmm)@@"
+mkinitfs -F "base ext4 virtio network" -o /tmp/initramfs-graft "$KVER"
+dd if=/tmp/initramfs-graft of=/dev/vdc bs=1M 2>/dev/null
+echo "@@INITRAMFS-SIZE:$(stat -c %s /tmp/initramfs-graft)@@"
 
 step "root filesystem: ext4 on the whole disk"
-mkfs.ext4 -q -F -L nvmmroot /dev/vda
+mkfs.ext4 -q -F -L graftroot /dev/vda
 modprobe ext4
 mount -t ext4 /dev/vda /mnt
 mkdir -p /mnt/etc/apk
@@ -65,7 +65,7 @@ step "system configuration"
 echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100' >> /mnt/etc/inittab
 chroot /mnt passwd -d root
 echo '/dev/vda / ext4 rw,relatime 0 1' > /mnt/etc/fstab
-echo nvmm > /mnt/etc/hostname
+echo graft > /mnt/etc/hostname
 # eth0 is brought up if it is there; a VM without a network still boots.
 printf 'auto lo\niface lo inet loopback\n\nallow-hotplug eth0\nauto eth0\niface eth0 inet dhcp\n' \
     > /mnt/etc/network/interfaces
