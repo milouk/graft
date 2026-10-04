@@ -37,7 +37,7 @@
 #include <sys/un.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <sys/select.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -110,6 +110,7 @@ static pthread_mutex_t big = PTHREAD_MUTEX_INITIALIZER;
 static void cpu_wake(struct cpu *);
 static void ioapic_set_irq(int);
 static bool timer_irq_waiting(void);
+static void clock_rearm(uint64_t);
 static volatile bool running = true;
 static int exit_code;
 static bool verbose;
@@ -350,8 +351,10 @@ pit_load(int ch, uint16_t val)
 	c->reload = val;
 	c->start_ns = now_ns();
 	c->armed = true;
-	if (ch == 0)
+	if (ch == 0) {
 		c->next_irq_ns = c->start_ns + pit_period_ns(c);
+		clock_rearm(c->next_irq_ns);
+	}
 }
 
 static void
@@ -487,6 +490,7 @@ static struct {
 } uart;
 
 static struct termios saved_termios;
+static bool console_eof;
 static bool termios_saved;
 static bool escape_seen;
 
@@ -630,6 +634,8 @@ console_poll(void)
 	if ((uart.rx_head - uart.rx_tail) > sizeof(uart.rx) - sizeof(buf))
 		return;
 	n = read(STDIN_FILENO, buf, sizeof(buf));
+	if (n == 0)
+		console_eof = true;	/* nothing more will ever come */
 	for (i = 0; i < n; i++) {
 		if (escape_seen) {
 			escape_seen = false;
@@ -1653,11 +1659,13 @@ lapic_divisor(const struct lapic *a)
 static void
 lapic_timer_start(struct lapic *a)
 {
-	if (a->init_count == 0)
+	if (a->init_count == 0) {
 		a->deadline_ns = 0;
-	else
+	} else {
 		a->deadline_ns = now_ns() +
 		    (uint64_t)a->init_count * lapic_divisor(a);
+		clock_rearm(a->deadline_ns);
+	}
 }
 
 /* Fire this CPU's timer if it is due. */
@@ -2193,36 +2201,93 @@ cpu_wake(struct cpu *c)
 }
 
 /*
- * The clock: once a millisecond, fire whatever timers are due, pass on what
- * was typed, and bring every running CPU back out of the guest. A guest
- * that is busy computing would otherwise not come back often enough to be
- * handed its timer interrupts, or one raised just as it was going in.
+ * The clock thread fires the timers and passes on what is typed. It sleeps
+ * until the next timer is due or a key is pressed, so a machine with nothing
+ * to do costs the host next to nothing.
+ *
+ * It also brings every CPU that is in the guest back out, a hundred times a
+ * second. An interrupt raised for a CPU just as it was going in can be
+ * missed (the signal that should fetch it out arrives a moment too soon),
+ * and this bounds how long it then waits.
  */
+#define CLOCK_IDLE_NS	100000000ULL	/* with no timer set: 100 ms */
+#define CLOCK_SWEEP_NS	10000000ULL	/* the safety sweep: 10 ms */
+
+static int clock_pipe[2] = { -1, -1 };
+static uint64_t clock_target;		/* when the clock thread will wake */
+
+/* A timer was set for 'deadline'. Wake the clock thread if that is sooner
+ * than it meant to. Called with 'big' held. */
+static void
+clock_rearm(uint64_t deadline)
+{
+	if (clock_pipe[1] != -1 && deadline < clock_target) {
+		clock_target = deadline;
+		(void)write(clock_pipe[1], "", 1);
+	}
+}
+
 static void *
 ticker(void *arg)
 {
+	uint64_t now, next, last_sweep = 0;
+	struct timespec ts;
 	unsigned int i;
-	uint64_t now;
+	char drain[64];
+	fd_set rfds;
 
 	(void)arg;
 	while (running) {
-		usleep(1000);
 		pthread_mutex_lock(&big);
-		console_poll();
-		(void)pit_poll();
+		if (!console_eof)
+			console_poll();
+		next = pit_poll();
 		now = now_ns();
+		next = (next != 0) ? now + next : now + CLOCK_IDLE_NS;
 		for (i = 0; i < ncpus; i++) {
-			if (apic_mode)
-				lapic_timer_poll(&cpus[i], now);
-			if (cpus[i].in_guest)
-				pthread_kill(cpus[i].thread, SIGUSR1);
+			struct cpu *c = &cpus[i];
+
+			if (!apic_mode)
+				break;
+			lapic_timer_poll(c, now);
+			if (c->apic.deadline_ns != 0 && c->apic.deadline_ns < next)
+				next = c->apic.deadline_ns;
 		}
-		if (!running) {
-			for (i = 0; i < ncpus; i++)
-				pthread_cond_signal(&cpus[i].cond);
+		if (now - last_sweep >= CLOCK_SWEEP_NS) {
+			last_sweep = now;
+			for (i = 0; i < ncpus; i++) {
+				if (cpus[i].in_guest)
+					pthread_kill(cpus[i].thread, SIGUSR1);
+			}
 		}
+		/* A CPU in the guest needs the sweep; an idle machine does not. */
+		for (i = 0; i < ncpus; i++) {
+			if (cpus[i].in_guest && next > now + CLOCK_SWEEP_NS)
+				next = now + CLOCK_SWEEP_NS;
+		}
+		if (next > now + CLOCK_IDLE_NS)
+			next = now + CLOCK_IDLE_NS;
+		/* Behind already: the CPUs make it up; do not spin here. */
+		if (next < now + 50000)
+			next = now + 50000;
+		clock_target = next;
 		pthread_mutex_unlock(&big);
+
+		FD_ZERO(&rfds);
+		FD_SET(clock_pipe[0], &rfds);
+		if (!console_eof)
+			FD_SET(STDIN_FILENO, &rfds);
+		ts.tv_sec = 0;
+		ts.tv_nsec = (long)(next - now);
+		if (pselect(clock_pipe[0] + 1, &rfds, NULL, NULL, &ts,
+		    NULL) > 0 && FD_ISSET(clock_pipe[0], &rfds))
+			(void)read(clock_pipe[0], drain, sizeof(drain));
 	}
+
+	pthread_mutex_lock(&big);
+	for (i = 0; i < ncpus; i++)
+		cpu_wake(&cpus[i]);
+	pthread_mutex_unlock(&big);
 	return NULL;
 }
 
@@ -2326,16 +2391,17 @@ deliver_interrupts(struct cpu *c)
 	}
 }
 
-/* Sleep, with 'big' released, until woken or a millisecond-scale timeout. */
+/* Sleep, with 'big' released, until woken. */
 static void
 cpu_sleep(struct cpu *c)
 {
 	struct timespec ts;
 	struct timeval tv;
 
+	/* Woken when there is something to do; the timeout is a backstop. */
 	gettimeofday(&tv, NULL);
 	ts.tv_sec = tv.tv_sec;
-	ts.tv_nsec = (tv.tv_usec + 20000) * 1000;	/* 20 ms */
+	ts.tv_nsec = (tv.tv_usec + 250000) * 1000;	/* 250 ms */
 	if (ts.tv_nsec >= 1000000000) {
 		ts.tv_sec++;
 		ts.tv_nsec -= 1000000000;
@@ -2438,6 +2504,7 @@ cpu_thread(void *arg)
 {
 	struct cpu *c = arg;
 	struct nvmm_vcpu_exit *exit = c->vcpu.exit;
+	uint64_t now;
 
 	c->thread = pthread_self();
 	pthread_mutex_lock(&big);
@@ -2456,10 +2523,13 @@ cpu_thread(void *arg)
 		}
 		if (c->id == 0)
 			(void)pit_poll();
+		now = now_ns();
 		if (apic_mode)
-			lapic_timer_poll(c, now_ns());
+			lapic_timer_poll(c, now);
 		deliver_interrupts(c);
 
+		/* The clock's safety sweep must be running while this is. */
+		clock_rearm(now + CLOCK_SWEEP_NS);
 		c->in_guest = true;
 		pthread_mutex_unlock(&big);
 		if (nvmm_vcpu_run(&mach, &c->vcpu) == -1 && errno != EINTR)
@@ -2641,6 +2711,10 @@ main(int argc, char **argv)
 	setup_cpu(&cpus[0], entry);
 
 	console_init();
+	if (pipe(clock_pipe) == -1)
+		die("pipe: %s", strerror(errno));
+	(void)fcntl(clock_pipe[0], F_SETFL, O_NONBLOCK);
+	(void)fcntl(clock_pipe[1], F_SETFL, O_NONBLOCK);
 	for (i = 0; i < ncpus; i++) {
 		if (pthread_create(&threads[i], NULL, cpu_thread,
 		    &cpus[i]) != 0)
@@ -2652,6 +2726,7 @@ main(int argc, char **argv)
 	for (i = 0; i < ncpus; i++)
 		pthread_join(threads[i], NULL);
 	running = false;
+	(void)write(clock_pipe[1], "", 1);
 	pthread_join(tick, NULL);
 
 	if (verbose) {

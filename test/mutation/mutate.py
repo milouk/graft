@@ -37,7 +37,7 @@ MUTATIONS = [
      "\tif (0) {\n\t\thmapping->present = false;"),
     ("lazy memory: fault grants what the mapping does not allow", "port/nvmm_port_vm.c",
      "\tif (m == NULL || !m->obj->lazy || (want & ~m->prot) != 0) {",
-     "\tif (m == NULL || !m->obj->lazy) {"),
+     "\tif (m == NULL || !m->obj->lazy || (want & 0) != 0) {"),
     ("lazy memory: pages entered without being pinned", "port/nvmm_port_vm.c",
      "\tif (port_membuf_populate(m->obj->buf, (size_t)coff,\n\t    (size_t)(cend - coff)) != 0)\n\t\terror = ENOMEM;",
      "\t/* not pinned */"),
