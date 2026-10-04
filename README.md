@@ -29,7 +29,7 @@ before trusting any of it.
 | macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
 | Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
 | `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
-| `nvmm-run`, a small VMM of our own (`vmm/`) | Boots Alpine Linux from a disk image and runs Docker containers in it on the same Ryzen, with no QEMU involved: one vCPU, serial console, virtio disk. Its network card (vmnet) compiles and has not been run |
+| `nvmm-run`, a small VMM of our own (`vmm/`) | Runs Docker for the Mac on the same Ryzen with no QEMU: Alpine boots from a disk image in about six seconds and a `docker` client on macOS runs containers in it. One vCPU; see its section for what is missing |
 | QEMU with `-accel nvmm` on macOS | QEMU 7.2.22 on macOS 10.15.5 boots Linux and runs Docker through the driver, one vCPU. QEMU 11 builds and starts a machine on macOS 15 against the stand-in engine, but has not run a guest. More than one vCPU per machine has never been tried |
 
 **macOS versions.** One binary is meant to serve macOS 10.13 (the first with
@@ -195,9 +195,9 @@ halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
   the vCPU in its reset state as read back through the driver, and quits
   cleanly; the driver passes its tests afterwards.
 
-## nvmm-run: without QEMU
+## nvmm-run: Docker without QEMU
 
-`vmm/nvmm-run.c` is a virtual machine monitor of about 1,700 lines on
+`vmm/nvmm-run.c` is a virtual machine monitor of about 1,900 lines on
 libnvmm. It loads a Linux kernel directly (no firmware) and gives it a 16550
 serial console, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
 and virtio block and network devices on the memory-mapped transport. The
@@ -205,25 +205,41 @@ kernel is told there is no ACPI, no PCI and no local APIC, which is what
 keeps it small: NVMM leaves every device to userland, and the local APIC is
 by far the largest. The price is a single virtual CPU.
 
+`vmm/nvmm-docker` wraps it into a Docker host for the Mac:
+
 ```
 make vmm
-# Build the disk image and initramfs once (uses QEMU as a build tool only):
-ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> out/
-# Run, with the kernel from the same ISO (boot/vmlinuz-virt):
-build/nvmm-run -k vmlinuz-virt -i out/initramfs-nvmm -d out/rootfs.img \
-    -m 2048 -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet"
+# Once: the disk image, an initramfs and an SSH key. QEMU is used here, as
+# a build tool only; nothing at run time needs it.
+ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.nvmm-docker
+cp <the ISO's boot/vmlinuz-virt> ~/.nvmm-docker/
+
+vmm/nvmm-docker start
+export DOCKER_HOST=unix://$HOME/.nvmm-docker/docker.sock
+docker run --rm alpine uname -a
+vmm/nvmm-docker stop
 ```
 
-On the Ryzen 7 2700 under macOS 10.15.5, `vmm/docker-test.exp` boots that
-image to a login in a few seconds, and `docker ps -a`, `docker run
-hello-world` and an Alpine container all work, from images already in the
-disk. What is not there yet:
+It also needs [gvproxy](https://github.com/containers/gvisor-tap-vsock), a
+single binary that gives the VM its network (DHCP, DNS, a route out) without
+privileges, and carries the Docker socket to the VM over SSH. The network
+card can sit on macOS's vmnet instead (`nvmm-run -n vmnet`, as root), but on
+the one machine tried, macOS 10.15.5, vmnet never answered a request for an
+interface in any of its modes (`vmm/vmnet-probe.c` shows this without
+involving nvmm-run), so that path is untested.
 
-- The network card (`-n`, macOS vmnet, needs root) has never been run.
+On the Ryzen 7 2700 under macOS 10.15.5, with a Docker 24 client on the Mac:
+`nvmm-docker start` takes about six seconds; `docker ps`, `docker run` with
+output and with piped input, pulls from Docker Hub, and a container with a
+published port all work. What is not there yet:
+
+- Published ports are reachable inside the VM, not from the Mac.
+- No file sharing: `-v /a/mac/path:...` has nothing to mount.
+- One vCPU. More needs a local APIC and I/O APIC.
 - Disk writes are slow, about 10 MB/s: every request costs a trip through
   the instruction emulator.
-- One vCPU. More needs a local APIC and I/O APIC.
 - The guest cannot power itself off; it halts, and nvmm-run notices.
+- It has run for minutes, not days.
 
 ## First load on real hardware
 

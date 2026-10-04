@@ -1,0 +1,121 @@
+#!/bin/sh
+#
+# nvmm-docker — run the Docker VM in the background and point the docker
+# client on this Mac at it.
+#
+#   nvmm-docker start     boot the VM and wait until Docker answers
+#   nvmm-docker stop      shut the VM down
+#   nvmm-docker status    say whether it is running
+#   nvmm-docker console   show what the VM has printed
+#   nvmm-docker ssh [cmd] a shell, or a command, in the VM
+#
+# It needs, in $NVMM_DOCKER_DIR (default ~/.nvmm-docker): vmlinuz-virt,
+# initramfs-nvmm, rootfs.img and id_nvmm, as made by vmm/build-image.exp.
+# And on the PATH, or named by $NVMM_RUN and $GVPROXY: nvmm-run and gvproxy.
+#
+# The Docker daemon is reached through a socket in that directory, which
+# only its owner can open. gvproxy carries it to the VM over SSH, with the
+# key the image was built with; "nvmm-docker ssh" uses the same way in.
+
+set -eu
+
+DIR=${NVMM_DOCKER_DIR:-"$HOME/.nvmm-docker"}
+NVMM_RUN=${NVMM_RUN:-nvmm-run}
+GVPROXY=${GVPROXY:-gvproxy}
+MEM=${NVMM_DOCKER_MEM:-2048}
+SSH_PORT=${NVMM_DOCKER_SSH_PORT:-2222}
+SOCK="$DIR/docker.sock"
+
+vm_pid()  { cat "$DIR/vm.pid" 2>/dev/null || true; }
+net_pid() { cat "$DIR/gvproxy.pid" 2>/dev/null || true; }
+alive()   { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+ping_docker() {
+	[ "$(curl -s -m 2 --unix-socket "$SOCK" http://docker/_ping 2>/dev/null)" = "OK" ]
+}
+vm_ssh() {
+	ssh -q -i "$DIR/id_nvmm" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
+	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+	    root@127.0.0.1 "$@"
+}
+
+start() {
+	if alive "$(vm_pid)"; then
+		echo "already running (pid $(vm_pid))"
+		return 0
+	fi
+	for f in vmlinuz-virt initramfs-nvmm rootfs.img id_nvmm; do
+		[ -f "$DIR/$f" ] || { echo "missing $DIR/$f" >&2; exit 1; }
+	done
+	[ -e /dev/nvmm ] || { echo "/dev/nvmm is not there; is NVMM.kext loaded?" >&2; exit 1; }
+
+	# gvproxy is the VM's network, and it also carries the Docker socket:
+	# it keeps trying the VM's SSH server until that is up.
+	rm -f "$DIR/net.sock" "$DIR/console.in" "$SOCK"
+	"$GVPROXY" -listen-qemu "unix://$DIR/net.sock" -ssh-port "$SSH_PORT" \
+	    -forward-sock "$SOCK" -forward-dest /var/run/docker.sock \
+	    -forward-user root -forward-identity "$DIR/id_nvmm" \
+	    -pid-file "$DIR/gvproxy.pid" -log-file "$DIR/gvproxy.log" \
+	    > /dev/null 2>&1 &
+	i=0
+	while [ ! -S "$DIR/net.sock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+	[ -S "$DIR/net.sock" ] || { echo "gvproxy did not start; see $DIR/gvproxy.log" >&2; exit 1; }
+
+	# The VM's console: what it prints goes to a file, and what it reads
+	# comes from a pipe, which is how "stop" asks it to shut down.
+	mkfifo "$DIR/console.in"
+	"$NVMM_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-nvmm" \
+	    -d "$DIR/rootfs.img" -n "$DIR/net.sock" -m "$MEM" \
+	    -a "root=/dev/vda rootfstype=ext4 modules=ext4 quiet" \
+	    0<> "$DIR/console.in" > "$DIR/console.log" 2>&1 &
+	echo $! > "$DIR/vm.pid"
+
+	i=0
+	while [ $i -lt 120 ]; do
+		alive "$(vm_pid)" || { echo "the VM stopped; see $DIR/console.log" >&2; exit 1; }
+		if ping_docker; then
+			echo "Docker is up. Use it with:"
+			echo "  export DOCKER_HOST=unix://$SOCK"
+			return 0
+		fi
+		sleep 0.5
+		i=$((i + 1))
+	done
+	echo "the VM is running but Docker did not answer; see $DIR/console.log" >&2
+	exit 1
+}
+
+stop() {
+	pid=$(vm_pid)
+	if alive "$pid"; then
+		# Ask over SSH; failing that, log in on the console and ask there.
+		if ! vm_ssh poweroff 2>/dev/null; then
+			printf '\rroot\r' > "$DIR/console.in"
+			sleep 2
+			printf 'poweroff\r' > "$DIR/console.in"
+		fi
+		i=0
+		while alive "$pid" && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
+		if alive "$pid"; then
+			echo "the VM did not shut down; stopping it" >&2
+			kill "$pid"
+		fi
+	fi
+	alive "$(net_pid)" && kill "$(net_pid)"
+	rm -f "$DIR/vm.pid" "$DIR/gvproxy.pid" "$DIR/net.sock" "$SOCK" \
+	    "$DIR/console.in"
+	echo "stopped"
+}
+
+case "${1:-}" in
+start)   start ;;
+stop)    stop ;;
+status)
+	if alive "$(vm_pid)"; then
+		echo "running (pid $(vm_pid)); Docker $(ping_docker && echo answers || echo "does not answer") on unix://$SOCK"
+	else
+		echo "not running"
+	fi ;;
+console) cat "$DIR/console.log" ;;
+ssh)	 shift; vm_ssh "$@" ;;
+*)	 echo "usage: nvmm-docker start|stop|status|console|ssh" >&2; exit 2 ;;
+esac

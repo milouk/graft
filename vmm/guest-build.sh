@@ -5,6 +5,7 @@
 
 set -e
 trap 'echo "@@RESULT:1@@"' EXIT
+[ -n "${PUBKEY:-}" ] || { echo "no PUBKEY given"; exit 1; }
 step() { echo "@@STEP: $*"; }
 
 REPO=https://dl-cdn.alpinelinux.org/alpine/v3.24
@@ -31,7 +32,8 @@ mkdir -p /mnt/etc/apk
 cp -a /etc/apk/keys /mnt/etc/apk/
 cp /etc/apk/repositories /mnt/etc/apk/
 apk --no-progress --root /mnt --initdb \
-    --repositories-file /etc/apk/repositories add alpine-base docker e2fsprogs
+    --repositories-file /etc/apk/repositories add alpine-base docker \
+    e2fsprogs openssh-server
 
 step "kernel modules: the ISO's own"
 mkdir -p /mnt/lib/modules
@@ -54,6 +56,18 @@ for s in mount-ro killprocs savecache; do
 	chroot /mnt rc-update add $s shutdown
 done
 for s in cgroups docker; do chroot /mnt rc-update add $s default; done
+# An SSH server, with the host's key (build-image.exp puts PUBKEY at the top
+# of this script) as the only way in. The host reaches the Docker socket
+# through it; see vmm/nvmm-docker.
+for s in sshd; do chroot /mnt rc-update add $s default; done
+# Alpine ships its SSH server with forwarding off, and the Docker socket
+# travels as a forwarded connection.
+sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /mnt/etc/ssh/sshd_config
+echo 'AllowStreamLocalForwarding yes' >> /mnt/etc/ssh/sshd_config
+mkdir -p /mnt/root/.ssh
+chmod 700 /mnt/root/.ssh
+echo "$PUBKEY" > /mnt/root/.ssh/authorized_keys
+chmod 600 /mnt/root/.ssh/authorized_keys
 # Docker's service waits for "net"; do not let a missing card block it.
 echo 'rc_need="!net"' >> /mnt/etc/conf.d/docker
 

@@ -1,8 +1,8 @@
 #!/usr/bin/expect -f
 #
 # build-image.exp — make what nvmm-run boots: a root filesystem image
-# (Alpine Linux with Docker and two container images) and an initramfs
-# that can mount it.
+# (Alpine Linux with Docker and two container images), an initramfs that can
+# mount it, and an SSH key (id_nvmm) that the image accepts for root.
 #
 #   ./build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>
 #
@@ -47,8 +47,20 @@ file delete -force $sock $rootfs $script $scratch
 
 exec $qimg create -f raw $rootfs $size
 exec $qimg create -f raw $scratch 64M
-# The script, padded to a whole number of sectors with newlines.
-exec sh -c "cat '$here/guest-build.sh' > '$script'; \
+# A key pair for the host to reach the VM with. Kept if it is already there,
+# so that rebuilding the image does not lock out a running setup's key.
+set key $outdir/id_nvmm
+if {![file exists $key]} {
+    exec ssh-keygen -q -t ed25519 -N "" -C nvmm-docker -f $key
+}
+set fh [open $key.pub]
+set pubkey [string trim [read $fh]]
+close $fh
+
+# The script, with the public key in front of it, padded to a whole number
+# of sectors with newlines.
+exec sh -c "printf 'PUBKEY=\"%s\"\n' '$pubkey' > '$script'; \
+    cat '$here/guest-build.sh' >> '$script'; \
     n=\$(wc -c < '$script'); pad=\$(( (512 - n % 512) % 512 + 512 )); \
     awk -v n=\$pad 'BEGIN { for (i = 0; i < n; i++) printf \"\\n\" }' >> '$script'"
 
@@ -103,4 +115,4 @@ for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
 if {$isize <= 0} { puts "### no initramfs size reported"; exit 1 }
 exec head -c $isize $scratch > $initramfs
 file delete -force $script $scratch $sock
-puts "\n### built $rootfs and $initramfs ($isize bytes)"
+puts "\n### built $rootfs and $initramfs ($isize bytes); key in $key"
