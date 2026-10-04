@@ -111,13 +111,23 @@ test_state(struct vm *vm)
 	CHECK(vm->vcpu.state->gprs[NVMM_X64_GPR_RIP] == 0xFFF0);
 	CHECK(vm->vcpu.state->segs[NVMM_X64_SEG_CS].selector == 0xF000);
 
-	/* What is written through the comm page comes back from the kernel. */
+	/*
+	 * State set through the comm page reaches the kernel when the vCPU
+	 * runs. Running also invalidates the library's cached copy, so what
+	 * is read afterwards has come back from the kernel.
+	 */
 	set_gpr(vm, NVMM_X64_GPR_R15, 0x1122334455667788ULL);
 	set_gpr(vm, NVMM_X64_GPR_RIP, 0x1000);
-	vm->vcpu.state->gprs[NVMM_X64_GPR_R15] = 0;	/* scribble locally */
 	set_gpr(vm, NVMM_X64_GPR_RAX, NVMM_FAKE_CMD_HLT);
 	CHECK(nvmm_vcpu_run(&vm->mach, &vm->vcpu) == 0);
 	CHECK(vm->vcpu.exit->reason == NVMM_VCPU_EXIT_HALTED);
+
+	/*
+	 * Scribble on the local copy. It is stale now, so the next read must
+	 * replace it with the kernel's values rather than trust it.
+	 */
+	vm->vcpu.state->gprs[NVMM_X64_GPR_R15] = 0;
+	vm->vcpu.state->gprs[NVMM_X64_GPR_RIP] = 0;
 	rip = get_gpr(vm, NVMM_X64_GPR_RIP);
 	CHECK(rip == 0x1001);
 	CHECK(get_gpr(vm, NVMM_X64_GPR_R15) == 0x1122334455667788ULL);
@@ -177,8 +187,12 @@ test_errors(struct vm *vm)
 
 	/* The same vCPU twice. */
 	CHECK(nvmm_vcpu_create(&vm->mach, 0, &dup) == -1);
-	/* Guest memory that was never registered with nvmm_hva_map(). */
-	CHECK(nvmm_gpa_map(&vm->mach, 0x10000, 1ULL << 30, 4096,
+	/*
+	 * A guest-physical range that overlaps existing guest RAM. libnvmm
+	 * catches this one itself. (A mapping the KERNEL refuses is different:
+	 * libnvmm calls abort() on that by design, so it is not tested here.)
+	 */
+	CHECK(nvmm_gpa_map(&vm->mach, (uintptr_t)vm->ram, 4096, 8192,
 	    PROT_READ) == -1);
 	/* A machine that does not exist. */
 	CHECK(nvmm_machine_destroy(&ghost) == -1);
