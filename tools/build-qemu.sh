@@ -6,48 +6,45 @@
 # it on NetBSD. This downloads a QEMU release, widens that one check to macOS,
 # and builds it against this repository's libnvmm.
 #
-# Run it on the Intel or AMD Mac that will use it. QEMU's own dependencies
-# come from MacPorts; Homebrew no longer installs on x86_64 Macs.
-#
-#   sudo port -N install pkgconfig ninja glib2 libpixman python313
-#   sudo port select --set python3 python313
+# Run it on the Intel or AMD Mac that will use it. It needs only the Xcode
+# command line tools: QEMU's other dependencies are fetched and built by
+# tools/bootstrap-deps.sh, which this script runs if they are missing.
 #
 # Usage:  ./tools/build-qemu.sh [qemu-version]      default: 11.1.2
+#         NVMM_BUILD_DIR=/some/dir ./tools/build-qemu.sh
 #
-# Everything is built under ./build/qemu; nothing is installed system-wide.
-# The result is build/qemu/qemu-<version>/build/qemu-system-x86_64.
+# Everything is built under the build directory; nothing is installed
+# system-wide. The result is <build>/qemu/qemu-<version>/build/qemu-system-x86_64.
 #
 set -eu
 
 VERSION=${1:-11.1.2}
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-WORK="$ROOT/build/qemu"
+BUILD=${NVMM_BUILD_DIR:-"$ROOT/build"}
+DEPS="$BUILD/deps"
+WORK="$BUILD/qemu"
 SRC="$WORK/qemu-$VERSION"
 TARBALL="$WORK/qemu-$VERSION.tar.xz"
 
-# MacPorts lives in /opt/local and is not always on a non-login shell's PATH.
-PATH="/opt/local/bin:/opt/local/sbin:$PATH"
-export PATH
-PKG_CONFIG_PATH="/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export PKG_CONFIG_PATH
-
 if [ "$(uname -m)" != "x86_64" ]; then
-	echo "ERROR: this builds for x86_64 Macs; this machine is $(uname -m)." >&2
+	echo "ERROR: this builds for x86_64 Macs; this shell is $(uname -m)." >&2
 	exit 1
 fi
 
-for tool in pkg-config ninja python3; do
-	command -v "$tool" >/dev/null 2>&1 || {
-		echo "ERROR: $tool not found. Install MacPorts, then run:" >&2
-		echo "  sudo port -N install pkgconfig ninja glib2 libpixman python313" >&2
-		echo "  sudo port select --set python3 python313" >&2
-		exit 1
-	}
-done
-pkg-config --exists glib-2.0 || {
-	echo "ERROR: glib not found. Run: sudo port -N install glib2 libpixman" >&2
-	exit 1
-}
+# Cheap when everything is already there, and it picks up anything a newer
+# version of the bootstrap adds.
+"$ROOT/tools/bootstrap-deps.sh" 
+
+# A deliberately bare PATH. QEMU's configure probes for dozens of optional
+# libraries through helper programs on the PATH, and whatever a package
+# manager left on this machine (possibly for another CPU architecture) must
+# not leak into the build.
+PATH="$DEPS/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+PKG_CONFIG="$DEPS/venv/bin/pkg-config-real"
+export PKG_CONFIG
+PKG_CONFIG_PATH="$DEPS/prefix/lib/pkgconfig"
+export PKG_CONFIG_PATH
 
 echo "==> libnvmm"
 make -C "$ROOT" libnvmm >/dev/null
@@ -56,7 +53,7 @@ make -C "$ROOT" libnvmm >/dev/null
 mkdir -p "$WORK"
 if [ ! -f "$TARBALL" ]; then
 	echo "==> downloading QEMU $VERSION"
-	curl -fL --retry 3 -o "$TARBALL.part" \
+	curl -fsSL --retry 3 -o "$TARBALL.part" \
 	    "https://download.qemu.org/qemu-$VERSION.tar.xz"
 	mv "$TARBALL.part" "$TARBALL"
 fi
@@ -86,10 +83,18 @@ PY
 echo "==> configuring"
 mkdir -p "$SRC/build"
 cd "$SRC/build"
+# pixman is only needed for graphical output, which a container host has no
+# use for. The crypto libraries are optional too: QEMU falls back to its own
+# implementations.
 ../configure \
-    --python="$(command -v python3)" \
+    --python="$DEPS/venv/bin/python" \
+    --ninja="$DEPS/venv/bin/ninja" \
     --target-list=x86_64-softmmu \
     --enable-nvmm \
+    --disable-pixman \
+    --disable-gcrypt \
+    --disable-gnutls \
+    --disable-nettle \
     --disable-docs \
     --disable-guest-agent \
     --disable-werror \
