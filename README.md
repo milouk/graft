@@ -11,8 +11,9 @@ it gives QEMU, and anything built on QEMU, hardware-speed virtual machines.
 
 ## Status
 
-**The kernel extension has never been loaded on a real machine.** Read this
-table before trusting any of it.
+**No guest has run on real hardware yet.** The engine has only run under
+emulation, and the macOS glue has only run without the engine. Read this table
+before trusting any of it.
 
 | Piece | State |
 |---|---|
@@ -20,7 +21,8 @@ table before trusting any of it.
 | Nested page table builder (`port/npt.c`) | Unit tested, and exercised by the engine tests |
 | Guest-memory layer (`port/nvmm_port_vm.c`) | Exercised by the engine tests, with leak accounting |
 | World-switch assembly (host VMCB variant) | Exercised by the engine tests; host state checked after every guest run |
-| macOS glue (`darwin/`) | **Compiles and links only.** Every imported symbol is confirmed exported on macOS 15. Never run |
+| macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported on macOS 15 and 10.15 |
+| Engine and glue together, on an AMD CPU | **Never run** |
 | `libnvmm` for macOS | Not started |
 | QEMU with `-accel nvmm` on macOS | Not started |
 
@@ -34,7 +36,9 @@ What the tests cannot show, because the emulator hides it:
   instructions the tests use. Real CPUs take the normal path, which the tests
   therefore do not cover.
 - **More than one CPU.** The test kernel runs on one.
-- **Anything in `darwin/`.**
+
+What the glue self-test cannot show: anything about SVM. It runs on Intel
+Macs precisely because it leaves the engine out.
 
 ## Layout
 
@@ -61,6 +65,7 @@ make unit         # page table builder, with sanitizers
 make test-bare    # link the test kernel and boot it under emulated AMD-V
 make kext         # build/NVMM.kext, x86_64
 make check        # all three
+make selftest     # the glue self-test kext and its driver program
 ./tools/check-kpi.sh          # every symbol the kext imports is exported
 ./test/mutation/mutate.py     # each deliberate bug is caught (slow)
 ```
@@ -94,9 +99,34 @@ So this port uses only exported interfaces, and pays for it in a few places:
   and machines can be tied to the open that created them.
 - **4K pages only** in the nested page table, for now.
 
+## The glue self-test
+
+`make selftest` builds `NVMMSelfTest.kext`, which is the same extension with
+the CPU check and the engine left out, and `nvmm-selftest`, which drives it
+through `/dev/nvmm-selftest`. It loads on any x86_64 Mac and checks wired
+memory, host-physically contiguous allocations, nested page tables built from
+real physical addresses, locks, preemption control, calls to every CPU, FPU
+and debug-register parking, mappings into a process (anywhere and at a fixed
+address), cleanup after a process that exits without unmapping, and that the
+device node survives being looked up hundreds of times.
+
+Running it on a real machine found two bugs that emulation could not:
+
+- **The device node.** devfs calls a cloning device's clone function on every
+  lookup, not only on open. Reserving a slot there exhausted the device after
+  sixteen `lstat()` calls, and returning -1 then left the node permanently
+  "being created", which froze `sudo` and `sshd`.
+- **Contiguity.** With an I/O mapper present, `kIOMemoryPhysicallyContiguous`
+  is contiguous for a device, not for the CPU. Control blocks now ask for
+  `kIOMemoryHostPhysicallyContiguous`.
+
+On macOS 11 and later a kext has to be approved in System Settings and the
+machine restarted before it will load, and again each time the binary changes.
+
 ## First load on real hardware
 
-None of this has been done. It is the plan.
+The self-test kext has been through this on an Intel Mac. The real kext, with
+the engine, has not been loaded anywhere. This is the plan for it.
 
 Requirements: an AMD CPU with SVM enabled in the firmware, a system that
 accepts unsigned kernel extensions (`csr-active-config` with the kext-signing
