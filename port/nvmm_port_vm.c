@@ -175,6 +175,17 @@ os_vmspace_pdirpa(os_vmspace_t *vs)
 	return npt_root_pa(&vs->npt);
 }
 
+bool
+port_vm_guest_lookup(os_vmspace_t *vs, vaddr_t gpa, paddr_t *hpa)
+{
+	bool found;
+
+	port_mtx_lock(&vs->lock);
+	found = npt_lookup(&vs->npt, gpa, hpa, NULL);
+	port_mtx_unlock(&vs->lock);
+	return found;
+}
+
 uint64_t
 os_vmspace_gen(os_vmspace_t *vs)
 {

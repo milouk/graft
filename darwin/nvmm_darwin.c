@@ -32,6 +32,9 @@
 #include <IOKit/IOLib.h>
 
 #include "nvmm_darwin_mem.h"
+#if defined(NVMM_DARWIN_SELFTEST)
+#include "nvmm_darwin_selftest.h"
+#endif
 
 /* Exported by com.apple.kpi.unsupported on x86_64, but not declared in the SDK. */
 extern int cpu_number(void);
@@ -416,6 +419,11 @@ static const struct cdevsw nvmm_cdevsw = {
 void
 nvmm_darwin_will_sleep(void)
 {
+#if defined(NVMM_DARWIN_SELFTEST)
+	/* No engine in this build: just record that the notification came. */
+	os_atomic_inc_uint(&nvmm_selftest_sleeps);
+	return;
+#endif
 	/*
 	 * A CPU comes back from sleep with SVM switched off and its host save
 	 * area forgotten. nvmm_port_suspend() parks every vCPU loop first, so
@@ -430,6 +438,10 @@ nvmm_darwin_will_sleep(void)
 void
 nvmm_darwin_did_wake(void)
 {
+#if defined(NVMM_DARWIN_SELFTEST)
+	os_atomic_inc_uint(&nvmm_selftest_wakes);
+	return;
+#endif
 	nvmm_port_resume();
 }
 
@@ -479,6 +491,27 @@ nvmm_kext_start(kmod_info_t *ki __unused, void *data __unused)
 
 	nvmm_darwin_mem_init();
 	port_init();
+
+#if defined(NVMM_DARWIN_SELFTEST)
+	/*
+	 * Glue self-test build: no CPU check and no engine, so this loads on
+	 * any x86_64 Mac. See nvmm_darwin_selftest.c.
+	 */
+	error = port_x86_init();
+	if (error != 0) {
+		printf("nvmm: cannot set up FPU state storage (%d)\n", error);
+		goto fail_port;
+	}
+	error = nvmm_selftest_attach();
+	if (error != 0) {
+		printf("nvmm: cannot create the self-test device (%d)\n",
+		    error);
+		goto fail_x86;
+	}
+	nvmm_darwin_power_register();
+	printf("nvmm: self-test build attached; the engine is not started\n");
+	return KERN_SUCCESS;
+#endif
 
 	if (nvmm_ident() == NULL) {
 		printf("nvmm: this CPU is not supported (AMD with SVM, nested "
@@ -534,6 +567,18 @@ nvmm_kext_stop(kmod_info_t *ki __unused, void *data __unused)
 {
 	int i;
 
+#if defined(NVMM_DARWIN_SELFTEST)
+	if (nvmm_selftest_detach() != 0)
+		return KERN_FAILURE;
+	nvmm_darwin_power_unregister();
+	port_x86_fini();
+	port_fini();
+	nvmm_darwin_mem_fini();
+	darwin_locks_fini();
+	printf("nvmm: self-test build detached\n");
+	return KERN_SUCCESS;
+#endif
+
 	if (os_atomic_load_uint(&nvmm_nmachines) > 0)
 		return KERN_FAILURE;
 	for (i = 0; i < NVMM_MAXOPEN; i++) {
@@ -561,7 +606,11 @@ nvmm_kext_stop(kmod_info_t *ki __unused, void *data __unused)
 extern kern_return_t _start(kmod_info_t *ki, void *data);
 extern kern_return_t _stop(kmod_info_t *ki, void *data);
 
+#if defined(NVMM_DARWIN_SELFTEST)
+KMOD_EXPLICIT_DECL(org.nvmm.driver.NVMMSelfTest, "0.1.0", _start, _stop)
+#else
 KMOD_EXPLICIT_DECL(org.nvmm.driver.NVMM, "0.1.0", _start, _stop)
+#endif
 __private_extern__ kmod_start_func_t *_realmain = nvmm_kext_start;
 __private_extern__ kmod_stop_func_t *_antimain = nvmm_kext_stop;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;

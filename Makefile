@@ -4,7 +4,8 @@
 #   make bare        compile the bare-metal test kernel (objects only)
 #   make test-bare   link it and run it under QEMU with emulated AMD-V (Docker)
 #   make kext        compile and link the macOS kernel extension (x86_64)
-#   make check       everything above
+#   make selftest    the glue self-test kext and its driver program
+#   make check       unit, test-bare and kext
 #   make clean
 
 BUILD		:= build
@@ -17,7 +18,7 @@ COMMON_INC	:= -Iport -Iport/compat -Isrc
 WARN		:= -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 		   -Wno-missing-field-initializers
 
-.PHONY: all check unit bare test-bare kext clean
+.PHONY: all check unit bare test-bare kext selftest clean
 all: check
 check: unit test-bare kext
 
@@ -108,6 +109,46 @@ $(KEXT_BUNDLE)/Contents/MacOS/NVMM: $(KEXT_OBJS) darwin/Info.plist
 	    -mmacosx-version-min=10.15 -isysroot $(SDK) \
 	    -o $@ $(KEXT_OBJS) -lkmod -lkmodc++ -lcc_kext
 	cp darwin/Info.plist $(KEXT_BUNDLE)/Contents/Info.plist
+
+# ----------------------------------------------- glue self-test (any Intel Mac)
+# The same kext without the engine's CPU check, plus a device that exercises
+# the macOS glue. See darwin/nvmm_darwin_selftest.c.
+ST_DIR		:= $(BUILD)/kext-selftest
+ST_BUNDLE	:= $(BUILD)/NVMMSelfTest.kext
+ST_OBJS		:= $(patsubst $(KEXT_DIR)/%,$(ST_DIR)/%,$(KEXT_OBJS)) \
+		   $(ST_DIR)/nvmm_darwin_selftest.o
+ST_TOOL		:= $(BUILD)/nvmm-selftest
+
+selftest: $(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest $(ST_TOOL)
+	@echo "built $(ST_BUNDLE) and $(ST_TOOL)"
+
+$(ST_DIR)/%.o: %.c
+	@mkdir -p $(ST_DIR)
+	$(CC) $(KEXT_CFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+
+$(ST_DIR)/%.o: %.S
+	@mkdir -p $(ST_DIR)
+	$(CC) $(KEXT_CFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+
+$(ST_DIR)/%.o: %.cpp
+	@mkdir -p $(ST_DIR)
+	clang++ $(KEXT_CXXFLAGS) -DNVMM_DARWIN_SELFTEST -MMD -MP -c $< -o $@
+
+-include $(ST_OBJS:.o=.d)
+
+$(ST_BUNDLE)/Contents/MacOS/NVMMSelfTest: $(ST_OBJS) darwin/Info.plist
+	@mkdir -p $(ST_BUNDLE)/Contents/MacOS
+	clang++ -arch x86_64 -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
+	    -mmacosx-version-min=10.15 -isysroot $(SDK) \
+	    -o $@ $(ST_OBJS) -lkmod -lkmodc++ -lcc_kext
+	sed -e 's/org\.nvmm\.driver\.NVMM/org.nvmm.driver.NVMMSelfTest/' \
+	    -e 's|<string>NVMM</string>|<string>NVMMSelfTest</string>|' \
+	    darwin/Info.plist > $(ST_BUNDLE)/Contents/Info.plist
+
+$(ST_TOOL): test/darwin/selftest.c darwin/nvmm_selftest_ioctl.h
+	@mkdir -p $(BUILD)
+	$(CC) -arch x86_64 -mmacosx-version-min=10.15 -O2 -Wall -Wextra -Werror \
+	    -Idarwin -o $@ test/darwin/selftest.c
 
 clean:
 	rm -rf $(BUILD)

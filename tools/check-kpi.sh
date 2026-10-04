@@ -9,6 +9,7 @@
 # symbol comes from, so OSBundleLibraries in Info.plist can be checked too.
 #
 # Usage:  ./tools/check-kpi.sh [xnu-tag]      default: newest xnu-11* (macOS 15)
+#         NVMM_KEXT=<binary> ./tools/check-kpi.sh   to check another kext
 #
 # Downloads about forty small text files into a temporary directory and
 # removes them afterwards.
@@ -16,7 +17,7 @@
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-KEXT="$ROOT/build/NVMM.kext/Contents/MacOS/NVMM"
+KEXT=${NVMM_KEXT:-"$ROOT/build/NVMM.kext/Contents/MacOS/NVMM"}
 REPO=apple-oss-distributions/xnu
 
 [ -f "$KEXT" ] || { echo "ERROR: build the kext first (make kext)" >&2; exit 1; }
