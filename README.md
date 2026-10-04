@@ -1,315 +1,404 @@
-# nvmm-darwin
+# Graft
 
-A port of [NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/), the
-NetBSD/DragonFly BSD hypervisor, to macOS on AMD processors.
+**Hardware virtualization for macOS on AMD processors, and Docker on top of
+it: the BSD hypervisor NVMM, plus about 6,000 new lines.**
 
 macOS only offers hardware virtualization through Apple's Hypervisor
-framework, which does not work on AMD CPUs. On an AMD Hackintosh that rules out
-Docker Desktop, OrbStack, Colima and current VirtualBox. NVMM implements AMD-V
-(SVM) itself, and QEMU already has an `nvmm` accelerator, so a macOS driver for
-it gives QEMU, and anything built on QEMU, hardware-speed virtual machines.
+framework, and that framework does not work on AMD CPUs. On an AMD
+Hackintosh, or in a macOS guest on an AMD server, that rules out Docker
+Desktop, OrbStack, Colima and current VirtualBox: there is nothing to
+install that fixes it.
+
+Graft takes [NVMM](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/), the
+hypervisor of NetBSD and DragonFly BSD, and grafts it onto macOS as a kernel
+extension. NVMM implements AMD-V itself, so nothing is needed from Apple. On
+top of it sit a small virtual machine monitor and a script that turn it into
+a Docker host:
+
+```sh
+$ nvmm-docker start                 # about six seconds
+$ export DOCKER_HOST=unix://$HOME/.nvmm-docker/docker.sock
+$ docker run --rm alpine uname -a
+Linux 6.18.52-0-virt x86_64
+```
+
+> **This is experimental.** It has run on one machine (a Ryzen 7 2700 under
+> macOS 10.15.5) for one evening, it panicked that machine once on the way,
+> and it has an open bug with several virtual CPUs. A kernel extension that
+> goes wrong takes the whole machine with it. Read [Status](#status) before
+> loading it.
+
+## Contents
+
+- [Design](#design)
+- [Status](#status)
+- [Usage guide](#usage-guide)
+- [How it is tested](#how-it-is-tested)
+- [How it differs from NVMM on BSD](#how-it-differs-from-nvmm-on-bsd)
+- [Known issues](#known-issues)
+- [Repository layout](#repository-layout)
+- [Resources](#resources)
+
+## Design
+
+NVMM has two halves, as on BSD: a kernel driver that runs guest code on the
+processor, and a userland program that provides everything else a machine
+needs. They talk through `/dev/nvmm` and the `libnvmm` library.
+
+```mermaid
+flowchart TB
+    subgraph mac["macOS userland"]
+        docker["docker client"]
+        gv["gvproxy<br/>network + socket forwarding"]
+        subgraph vmm["nvmm-run (or QEMU -accel nvmm)"]
+            dev["devices: serial, timers,<br/>interrupt controllers, virtio disk and net"]
+            lib["libnvmm"]
+        end
+    end
+
+    subgraph kernel["macOS kernel"]
+        subgraph kext["NVMM.kext"]
+            glue["darwin/ &mdash; /dev/nvmm, IOKit memory, sleep and wake"]
+            port["port/ &mdash; guest memory, nested page tables, locks"]
+            core["NVMM core &mdash; machines, vCPUs, ioctls"]
+            svm["AMD-V engine &mdash; VMRUN, exits, state"]
+        end
+    end
+
+    subgraph guest["Guest: Alpine Linux"]
+        dockerd["dockerd"]
+        ctr["containers"]
+    end
+
+    cpu(["AMD processor with SVM"])
+
+    docker -- "docker.sock" --> gv
+    gv <-- "frames over a socket" --> dev
+    dev --> lib
+    lib -- "ioctl" --> glue
+    glue --> core --> svm
+    core --> port
+    svm -- "VMRUN" --> cpu
+    cpu -. "runs" .-> guest
+    gv -. "SSH" .-> dockerd
+    dockerd --> ctr
+```
+
+The kernel extension is four layers, and there are two pieces of userland.
+Three of the six are new:
+
+| Layer | Lines | Origin |
+| --- | --- | --- |
+| AMD-V engine and NVMM core (`src/`) | ~7,000 | DragonFly BSD, with small marked changes |
+| `libnvmm` (`lib/`) | ~4,600 | DragonFly BSD, nearly unchanged |
+| Portable OS layer (`port/`) | ~1,900 | New. What NVMM needs from an operating system, for a host with no BSD virtual-memory system |
+| macOS glue (`darwin/`) | ~1,300 | New. The portable layer's few primitives, on IOKit and exported kernel interfaces |
+| `nvmm-run`, the VMM (`vmm/`) | ~2,800 | New. Boots Linux directly; no firmware, no PCI, no ACPI |
+
+The portable layer is the graft itself. It asks an operating system for very
+little: pinned pages whose physical addresses it may know, a way to map a
+buffer into a process, a way to run a function on every CPU, and locks.
+macOS is one implementation of that list; the test kernel in
+`test/baremetal`, which is not an operating system at all, is a second.
+
+### One trip into the guest
+
+A virtual CPU is a thread calling an ioctl in a loop. Most exits are handled
+in the kernel and the guest resumes at once; the rest go back to userland,
+where the device lives.
+
+```mermaid
+sequenceDiagram
+    participant V as vCPU thread (nvmm-run)
+    participant K as NVMM.kext
+    participant C as AMD CPU
+    participant G as Guest
+
+    V->>K: ioctl(VCPU_RUN)
+    loop up to 32 exits, or until the host interrupts
+        K->>C: VMRUN
+        C->>G: guest runs
+        G-->>C: exit (CPUID, MSR, page fault, I/O, HLT...)
+        C-->>K: VMEXIT
+        alt handled in the kernel
+            K->>K: CPUID, MSR, pin guest memory
+        else needs a device
+            K-->>V: return with the reason
+        end
+    end
+    V->>V: emulate the device, inject interrupts
+    V->>K: ioctl(VCPU_RUN) again
+```
+
+### Memory on demand
+
+A guest does not cost its full size from the start. The driver borrows the
+memory the VMM already has and pins it two megabytes at a time, the first
+time the guest touches each piece.
+
+```mermaid
+flowchart LR
+    A["Guest touches an address<br/>its page table has nothing for"] --> B{"Inside a<br/>RAM mapping?"}
+    B -- no --> C["Return to userland:<br/>a device access"]
+    B -- yes --> D{"Allowed by the<br/>mapping?"}
+    D -- no --> C
+    D -- yes --> E["Pin the 2 MB around it<br/>(IOKit, the process's own pages)"]
+    E --> F["Enter the pages in the<br/>nested page table"]
+    F --> G["Resume the guest"]
+```
 
 ## Status
 
-**It runs Linux and Docker on one machine, with one virtual CPU.** On
-2026-10-04, on a Ryzen 7 2700 running macOS 10.15.5, the kext passed
-`nvmm-guest-test` (5,598 checks), and QEMU 7.2 with `-accel nvmm` booted
-Alpine Linux 3.24, installed Docker in it, and ran containers
-(`test/darwin/docker-test.exp`). That is one run, on one machine and one
-macOS version, with a single vCPU and 2 GB of guest RAM. It also panicked
-that machine once the same evening (since fixed; see below). Read this table
-before trusting any of it.
+Everything below was measured on one machine: a Ryzen 7 2700, 16 GB, macOS
+10.15.5 (Catalina), on 2026-10-04.
 
 | Piece | State |
-|---|---|
-| SVM engine (from DragonFly BSD) | Runs guests under emulated AMD-V; tests pass |
-| Nested page table builder (`port/npt.c`) | Unit tested, and exercised by the engine tests |
-| Guest-memory layer (`port/nvmm_port_vm.c`) | Exercised by the engine tests, with leak accounting |
-| World-switch assembly (host VMCB variant) | Exercised by the engine tests; host state checked after every guest run |
-| macOS glue (`darwin/`) | Runs on real hardware **without the engine**: the self-test kext loads on macOS 15.7.9 (MacBookPro11,1, Intel) and passes. Every imported symbol is confirmed exported by every macOS from 10.13 to 15, and by 26 |
-| Engine and glue together, on an AMD CPU | Loads on macOS 10.15.5 (Ryzen 7 2700, 16 threads) and passes `nvmm-guest-test`: I/O, HLT, nested page faults, CPUID, FPU isolation, multi-second runs interrupted and resumed by the host hundreds of times, two guests at once, 200 machines created and destroyed. Not run on any other macOS version or CPU |
-| `libnvmm` for macOS (`lib/`) | Works against the kernel core on real Sequoia, through real ioctls, with the stand-in engine |
-| `nvmm-run`, a small VMM of our own (`vmm/`) | Runs Docker for the Mac on the same Ryzen with no QEMU: Alpine boots from a disk image in about six seconds and a `docker` client on macOS runs containers in it. One to four vCPUs; see its section for what is missing |
-| QEMU with `-accel nvmm` on macOS | QEMU 7.2.22 on macOS 10.15.5 boots Linux and runs Docker through the driver, one vCPU. QEMU 11 builds and starts a machine on macOS 15 against the stand-in engine, but has not run a guest. More than one vCPU per machine has never been tried |
+| --- | --- |
+| AMD-V engine | Runs real guests on real hardware. Under emulated AMD-V its tests pass 1,448 checks |
+| macOS glue | Self-test passed on macOS 15.7.9 (Intel, engine left out) and the full driver loads and runs on 10.15.5 |
+| `libnvmm` | Works; drives both QEMU and `nvmm-run` |
+| QEMU 7.2 with `-accel nvmm` | Boots Alpine Linux and runs Docker, one vCPU |
+| `nvmm-run` | Boots Alpine from a disk image in about six seconds; one to eight vCPUs |
+| `nvmm-docker` | `docker` on the Mac runs containers in the VM: output, piped input, pulls, published ports |
+| Memory on demand | Tested under emulation. **Compiled but never loaded on a Mac** |
+| macOS 15 (Sequoia) | Symbols check out; the engine has **never run there** |
 
-**macOS versions.** One binary is meant to serve macOS 10.13 (the first with
-AMD Ryzen support in the Hackintosh world) through 15. What that rests on:
-the kext imports only exported symbols, and `tools/check-kpi.sh` confirms
-each of them against the kernel sources of every release in that range. It
-has been *loaded* on 15.7.9 only.
+Measured with `nvmm-run`:
 
-What the emulator tests cannot show, because the emulator hides it (the first
-two have since passed on the Ryzen, in stage 4 of `nvmm-guest-test`):
+| | |
+| --- | --- |
+| `nvmm-docker start` to Docker answering | about 6 s |
+| Disk, direct read / direct write / buffered write with sync | about 900 / 550 / 270 MB/s |
+| Eight parallel CPU-bound jobs against one | 4.0 s against 2.9 s |
+| Idle VM, host CPU | about 1.7% of one core |
+| 20-minute load on four vCPUs | 153 rounds, none failed, **one 22-second guest stall** (see below) |
 
-- **TLB flushing.** QEMU's software AMD-V flushes on every world switch, so a
-  flush the engine forgets would go unnoticed. The mutation checker lists this
-  as a known blind spot.
-- **Next-RIP save.** QEMU does not emulate it, so test builds define
-  `NVMM_TEST_NO_NRIPS`, which fills the value in for the fixed-length
-  instructions the tests use. Real CPUs take the normal path, which the tests
-  therefore do not cover.
-- **More than one CPU.** The test kernel runs on one.
+One binary is meant to serve macOS 10.13 through 15: the kext imports only
+exported kernel symbols, and `tools/check-kpi.sh` confirms each against the
+kernel sources of every release in that range. It has been loaded on
+10.15.5 (full driver) and 15.7.9 (self-test build) only.
 
-What the glue self-test cannot show: anything about SVM. It runs on Intel
-Macs precisely because it leaves the engine out.
+## Usage guide
 
-## Layout
+### Requirements
 
-```
-upstream/   pristine DragonFly BSD sources at a pinned commit (see UPSTREAM)
-src/        the working copy of those sources, with NVMM_PORT hooks
-port/       NVMM's os_* interface for a host with no BSD VM system
-darwin/     the macOS kernel extension: platform hooks, /dev/nvmm, load/unload
-test/unit       userspace test for the page table builder
-test/baremetal  a freestanding kernel that boots in QEMU and drives the engine
-test/mutation   deliberate bugs, to check that the tests can fail
-test/darwin     programs that drive a loaded kext: the glue self-test, libnvmm
-                against the stand-in engine, and the first real guests
-vmm/        nvmm-run, a small VMM that replaces QEMU, and the scripts that
-            build and test its disk image
-lib/        libnvmm
-tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
+- An x86-64 Mac or Hackintosh with an **AMD CPU**, SVM enabled in the
+  firmware.
+- macOS 10.13 or later, with **SIP's kext-signing check off**: the kext is
+  unsigned. (`csr-active-config` with bit 0 set; on a Hackintosh that is an
+  OpenCore setting.)
+- The Xcode command line tools, to build.
+- A machine you can afford to panic.
+
+### Build
+
+```sh
+make kext            # build/NVMM.kext
+make vmm             # build/nvmm-run
+make guest-test      # build/nvmm-guest-test
+./tools/check-kpi.sh # every symbol the kext imports is exported
 ```
 
-`diff -ru upstream/sys/dev/virtual/nvmm src` shows exactly what was changed in
-the imported code. Only the AMD half was imported; there is no Intel support.
+### Load the driver
 
-## Building and testing
+Load it at run time, never from the bootloader, so that a panic costs one
+reboot and not a boot loop.
 
-Needs the Xcode command line tools and, for the emulator tests, Docker.
-
-```
-make unit         # page table builder, with sanitizers
-make test-bare    # link the test kernel and boot it under emulated AMD-V
-make kext         # build/NVMM.kext, x86_64
-make check        # all three
-make release      # build/release/NVMM.kext, stripped (about 50 KB)
-make guest-test   # nvmm-guest-test: the first real guests, for an AMD machine
-make libnvmm      # the userland library and headers
-make selftest     # the self-test kext (stand-in engine) and its test programs
-./tools/build-qemu.sh   # QEMU with the nvmm accelerator; run on an x86_64 Mac
-./tools/check-kpi.sh          # every symbol the kext imports is exported
-./test/mutation/mutate.py     # each deliberate bug is caught (slow)
+```sh
+sudo cp -R build/NVMM.kext /private/var/tmp/
+sudo chown -R root:wheel /private/var/tmp/NVMM.kext
+sudo kextutil /private/var/tmp/NVMM.kext          # macOS 10.15
+sudo kmutil load -p /private/var/tmp/NVMM.kext    # macOS 11 and later
+sudo dmesg | grep nvmm    # nvmm: attached, using backend x86-svm
 ```
 
-All of it runs on an Apple Silicon Mac. `make test-bare` builds a small Docker
-image holding `lld` and `qemu-system-x86_64`; remove it with
-`docker rmi nvmm-darwin-test`.
+On macOS 11 and later the kext also has to be approved in System Settings,
+with a restart, once per build. Unload with
+`sudo kextunload -b org.nvmm.driver.NVMM`. `/dev/nvmm` is root-only;
+`sudo chmod 666 /dev/nvmm` lets your user run VMs until the next load.
 
-Pushing a tag that starts with `v` runs `.github/workflows/release.yml`,
-which builds the stripped kext, repeats the symbol check for every macOS
-release, and attaches the result to a GitHub pre-release.
+### Check it, in stages
 
-## How it differs from NVMM on BSD
+`nvmm-guest-test` runs small real guests, in stages of rising risk, and
+prints each stage before starting it. Run it over ssh, so the last line
+survives a panic.
 
-On BSD, a machine owns a vmspace whose pmap doubles as the guest's nested page
-table, and guest pages are faulted in on demand. A macOS kernel extension has
-no supported way to do that, and earlier hypervisor ports to macOS that reached
-into private kernel structures stopped working when those structures changed.
-So this port uses only exported interfaces, and pays for it in a few places:
-
-- **Guest memory is eager and wired.** Guest RAM is an IOKit buffer; every page
-  is entered into a hand-built nested page table when it is mapped. A nested
-  page fault therefore always means "not RAM" and goes to the emulator. Guest
-  RAM stays wired for the life of the machine.
-- **Host state is saved in a VMCB.** The BSD code restores TR after a guest run
-  by clearing the busy bit in the host GDT. Here the host's VMLOAD/VMSAVE state
-  is parked in a per-CPU VMCB instead, which never touches the GDT.
-- **Preemption is held off with a spin lock.** macOS does not export its
-  preemption-disable primitive, but holding a spin lock has the same effect, so
-  there is one per CPU.
-- **The vCPU loop is bounded.** macOS offers no way for an extension to ask
-  whether the scheduler or a signal is waiting, so the loop cannot stay in the
-  kernel until one is. It handles up to 32 exits by itself, and returns to
-  userland at once on a host interrupt or when that budget is spent.
-- **`/dev/nvmm` is a cloning device**, so that each open gets its own minor
-  and machines can be tied to the open that created them.
-- **2M pages when the memory allows.** A guest buffer of 2M or more is built
-  from 2M-aligned, host-contiguous runs, as many as the system gives within
-  two seconds, with ordinary pages for the rest. Each run that lines up with
-  the guest address becomes one 2M entry in the nested page table, and is
-  split back into 4K pages if part of it is later unmapped.
-
-## The glue self-test
-
-`make selftest` builds `NVMMSelfTest.kext`, which is the same extension with
-the CPU check and the engine left out, and `nvmm-selftest`, which drives it
-through `/dev/nvmm-selftest`. It loads on any x86_64 Mac and checks wired
-memory, host-physically contiguous allocations, nested page tables built from
-real physical addresses, locks, preemption control, calls to every CPU, FPU
-and debug-register parking, mappings into a process (anywhere and at a fixed
-address), cleanup after a process that exits without unmapping, and that the
-device node survives being looked up hundreds of times.
-
-On a MacBookPro11,1 running macOS 15.7.9 it passes 68 in-kernel checks and
-all process-side checks, repeatedly, with no growth in IOKit object counts,
-and (in an earlier version) again after a real sleep and wake.
-`test/darwin/final-check.sh` runs all of it, the libnvmm test and QEMU in
-one go, then unloads and reloads the kext.
-
-The 2M memory path on that machine, two minutes after boot with 8 GB of RAM:
-buffers up to 16 MiB got every 2M run they asked for, in 1 to 60 ms. A 1 GiB
-buffer got 11 of 512 in 0.4 s before the system ran out of contiguous memory,
-and the rest fell back to ordinary pages as designed. So small guests get 2M
-pages; whether a large one does depends on how fragmented memory is, and has
-not been measured on a machine with more RAM.
-
-Running it on a real machine found two bugs that emulation could not:
-
-- **The device node.** devfs calls a cloning device's clone function on every
-  lookup, not only on open. Reserving a slot there exhausted the device after
-  sixteen `lstat()` calls, and returning -1 then left the node permanently
-  "being created", which froze `sudo` and `sshd`.
-- **Contiguity.** With an I/O mapper present, `kIOMemoryPhysicallyContiguous`
-  is contiguous for a device, not for the CPU. Control blocks now ask for
-  `kIOMemoryHostPhysicallyContiguous`.
-
-On macOS 11 and later a kext has to be approved in System Settings and the
-machine restarted before it will load, and again each time the binary changes.
-
-## libnvmm and QEMU
-
-`lib/` is libnvmm from DragonFly BSD. One thing differs on macOS: the kernel
-owns the process's mapping of the comm page, so `NVMM_IOC_VCPU_DESTROY`
-removes it and the library does not `munmap()` it.
-
-QEMU has carried an `nvmm` accelerator since 6.0, written against libnvmm,
-but its build only looks for it on NetBSD. `tools/build-qemu.sh` widens that
-one check and builds QEMU against this repository's library. It needs only
-the Xcode command line tools: `tools/bootstrap-deps.sh` fetches meson, ninja
-and pkg-config as Python wheels and builds glib from source, because Homebrew
-no longer installs on x86_64 Macs and MacPorts compiles about eighty packages
-to provide the same four things.
-
-To test all of this without AMD-V, the self-test kext puts a stand-in engine
-(`darwin/nvmm_fake_engine.c`) behind `/dev/nvmm`. It runs no guest code: it
-obeys a command in RAX, and treats a vCPU fresh out of reset as a guest that
-halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
-
-- `nvmm-fake-test` (libnvmm: machines, vCPUs, state through the comm page,
-  guest RAM over an existing mapping, the guest-physical map, error paths, a
-  child that exits without tidying up) passes 314 checks, repeatedly, with no
-  growth in IOKit object counts.
-- `qemu-system-x86_64 -accel nvmm -m 1G` starts, reports "NetBSD Virtual
-  Machine Monitor accelerator is operational" and `VM status: running`, shows
-  the vCPU in its reset state as read back through the driver, and quits
-  cleanly; the driver passes its tests afterwards.
-
-## nvmm-run: Docker without QEMU
-
-`vmm/nvmm-run.c` is a virtual machine monitor of about 2,700 lines on
-libnvmm. It loads a Linux kernel directly (no firmware) and gives it a 16550
-serial console, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
-and virtio block and network devices on the memory-mapped transport. The
-kernel is told there is no ACPI and no PCI, which is what keeps it small.
-
-With one virtual CPU there is no local APIC either. With more (`-c N`), each
-CPU has a local APIC and runs on its own thread, and the machine has an I/O
-APIC, described to the kernel by an MP table. NVMM leaves all of that to
-userland, so it is emulated here: the timer, fixed and lowest-priority
-interrupts, and the INIT and startup messages that bring the other CPUs up.
-
-`vmm/nvmm-docker` wraps it into a Docker host for the Mac:
-
+```sh
+sudo build/nvmm-guest-test 1   # open the device. No guest runs
+sudo build/nvmm-guest-test 2   # + machines and vCPUs. No guest runs
+sudo build/nvmm-guest-test 3   # + the first VMRUN: a guest that halts
+sudo build/nvmm-guest-test 4   # + I/O, memory faults, CPUID, FPU, 2M pages
+sudo build/nvmm-guest-test     # + long runs, two guests at once
 ```
-make vmm
-# Once: the disk image, an initramfs and an SSH key. QEMU is used here, as
-# a build tool only; nothing at run time needs it.
+
+### Docker
+
+Build the disk image once. This step uses QEMU, as a build tool only:
+nothing at run time needs it.
+
+```sh
+./tools/build-qemu.sh
 ACCEL=nvmm vmm/build-image.exp <qemu-system-x86_64> <alpine-virt.iso> ~/.nvmm-docker
 cp <the ISO's boot/vmlinuz-virt> ~/.nvmm-docker/
+```
 
+Then, with [gvproxy](https://github.com/containers/gvisor-tap-vsock/releases)
+and a `docker` client on the PATH:
+
+```sh
 vmm/nvmm-docker start
 export DOCKER_HOST=unix://$HOME/.nvmm-docker/docker.sock
-docker run --rm alpine uname -a
+docker run --rm -p 8080:80 nginx:alpine     # then: curl http://127.0.0.1:8080
+vmm/nvmm-docker ssh                         # a shell in the VM
 vmm/nvmm-docker stop
 ```
 
-It also needs [gvproxy](https://github.com/containers/gvisor-tap-vsock), a
-single binary that gives the VM its network (DHCP, DNS, a route out) without
-privileges, and carries the Docker socket to the VM over SSH. The network
-card can sit on macOS's vmnet instead (`nvmm-run -n vmnet`, as root), but on
-the one machine tried, macOS 10.15.5, vmnet never answered a request for an
-interface in any of its modes (`vmm/vmnet-probe.c` shows this without
-involving nvmm-run), so that path is untested.
+`NVMM_DOCKER_CPUS` and `NVMM_DOCKER_MEM` size the VM (default: one CPU,
+2048 MB). The Docker socket is readable only by its owner; gvproxy carries
+it to the VM over SSH with a key made when the image was built.
 
-On the Ryzen 7 2700 under macOS 10.15.5, with a Docker 24 client on the Mac:
-`nvmm-docker start` takes about six seconds; `docker ps`, `docker run` with
-output and with piped input, pulls from Docker Hub, and a container with a
-published port, reachable from the Mac, all work. Disk speed measured in the
-guest: about 900 MB/s direct reads, 550 MB/s direct writes, 270 MB/s
-buffered writes with a final sync. (One early run measured 10 MB/s; that
-did not reproduce.) What is not there yet:
+### nvmm-run on its own
 
-- Published ports are passed on for TCP only, and through a forwarder that
-  closes a connection when either side half-closes.
-- No file sharing: `-v /a/mac/path:...` has nothing to mount.
-- More than one vCPU works (two and four boot, and four busy loops run in
-  the time of one), but it is hours old: no long runs, no stress beyond that.
-  It is also the first time the driver has run several vCPUs in one machine.
-  The APICs are reached through the instruction emulator, which is slow; and
-  timers are served at one-millisecond resolution.
-- The guest cannot power itself off; it halts, and nvmm-run notices.
-- It has run for minutes, not days.
-
-## First load on real hardware
-
-This is the procedure that was followed for the first load, on macOS 10.15.5
-with SIP disabled; it went through without a panic.
-
-Requirements: an AMD CPU with SVM enabled in the firmware, a system that
-accepts unsigned kernel extensions (`csr-active-config` with the kext-signing
-bit clear), and something you can afford to panic. A spare macOS install
-booted from another disk is ideal; so is macOS running as a guest under
-Linux/KVM with AMD-V passed through.
-
-1. Build on any Mac: `make kext`, then `./tools/check-kpi.sh <xnu tag of the
-   target macOS>`.
-2. Copy `build/NVMM.kext` to the target and `sudo chown -R root:wheel` it.
-3. Load it at run time, not from the bootloader, so that a panic costs one
-   reboot instead of a boot loop: `sudo kextutil -v NVMM.kext` on macOS 10.15,
-   `sudo kmutil load -p NVMM.kext` on 11 and later.
-4. Look for `nvmm: attached, using backend x86-svm` in `dmesg`, and for
-   `/dev/nvmm`.
-5. Unload with `sudo kextunload NVMM.kext`.
-
-Then run `nvmm-guest-test` (`make guest-test`), over ssh so that the last
-line printed survives a panic. It is the checks of
-`test/baremetal/test_main.c` through libnvmm, in stages:
-
-```
-sudo ./nvmm-guest-test 1   # open the device. No guest runs
-sudo ./nvmm-guest-test 2   # + machines and vCPUs. No guest runs
-sudo ./nvmm-guest-test 3   # + the first VMRUN: a guest that halts
-sudo ./nvmm-guest-test 4   # + I/O, memory faults, CPUID, FPU, 2M pages
-sudo ./nvmm-guest-test     # + long runs, two guests at once, 200 machines
+```sh
+build/nvmm-run -k vmlinuz-virt -i initramfs-nvmm -d rootfs.img -c 4 -m 2048 \
+    -n /path/to/gvproxy-qemu.sock \
+    -a "root=/dev/vda rootfstype=ext4 modules=ext4"
 ```
 
-Stage 4 is where the two things emulation hides get their first test: TLB
-flushing after an unmap, and next-RIP save.
+The console is the terminal; Ctrl-A then x quits. The guest sees a 16550
+serial port, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
+and virtio block and network devices on the memory-mapped transport. With
+more than one CPU it also gets a local APIC per CPU and an I/O APIC,
+described by an MP table.
 
-## Known gaps
+### QEMU
 
-- Guests larger than 2 GB, long uptimes, and sleep and wake with a guest
-  running are untested. More than one vCPU in a machine has run only under
-  `nvmm-run`, for minutes.
-- A guest too large for the host to wire used to panic the host: the imported
-  code assumed that allocation could not fail. It now returns ENOMEM, and
-  the emulator tests cover it. Why a 4 GB guest could not be allocated on a
-  16 GB host after several earlier runs is not explained; guest memory was
-  seen to be released after a clean run.
-- Whether guest memory really ends up in 2M pages on the Ryzen is not known:
-  the guest test passes either way and does not report it.
-- Sleep and wake: the notifications arrive and the glue survives a cycle on
-  real hardware, and the engine's suspend path is tested under emulation, but
-  the two have not been tested together, and never with a guest running.
-- Hosts that enable AVX-512 lazily per thread (not AMD Zen or Zen+) are not
-  handled: the engine assumes one host XCR0.
-- `/dev/nvmm` is root-only.
-- A process that exits without closing its mappings relies on the device close
-  path to unwire guest RAM; that path has not run on macOS.
+`tools/build-qemu.sh` builds QEMU with its `nvmm` accelerator against this
+library, with no package manager: it fetches its build tools as Python
+wheels and builds glib, pixman and libslirp from source. It picks QEMU 11 on
+macOS 12 and later and 7.2 before that. `test/darwin/docker-test.exp` boots
+Alpine in it and runs Docker.
+
+## How it is tested
+
+Kernel code that is wrong takes the machine down, so as much as possible is
+proven before it touches a real one. The engine runs under an emulated AMD
+processor inside an ordinary test, and deliberate bugs are injected to show
+the tests can fail.
+
+```mermaid
+flowchart TB
+    subgraph any["On any Mac, with Docker"]
+        unit["Unit test<br/>nested page tables, 9,259 checks"]
+        bare["Test kernel under QEMU's emulated AMD-V<br/>the real engine and port layer, 1,448 checks"]
+        mut["Mutation run<br/>26 deliberate bugs, each must be caught"]
+        kpi["Symbol check<br/>against every macOS kernel, 10.13 to 15"]
+    end
+    subgraph intel["On any x86 Mac"]
+        self["Self-test kext<br/>the macOS glue with the engine left out"]
+    end
+    subgraph amd["On an AMD Mac"]
+        gt["nvmm-guest-test<br/>real guests in five stages"]
+        dt["docker-test<br/>Linux and Docker, QEMU or nvmm-run"]
+    end
+    unit --> bare --> mut
+    bare --> self --> gt --> dt
+    kpi --> self
+```
+
+```sh
+make check                  # unit test, emulator suite, kext build
+./test/mutation/mutate.py   # slow: one rebuild and run per bug
+```
+
+What emulation cannot show, and the first real machine had to: whether a
+stale translation survives an unmap (QEMU flushes on every switch), and the
+processor's next-instruction-pointer save (QEMU does not emulate it). Both
+passed on the Ryzen. What only real macOS could show cost two bugs on the
+way: a device node that hung every lookup after sixteen, and "contiguous"
+memory that was contiguous for a device but not for the CPU.
+
+## How it differs from NVMM on BSD
+
+On BSD, a machine owns an address space whose page tables double as the
+guest's, and the kernel's own fault handler fills them. A macOS kernel
+extension has no supported way to do that, and earlier hypervisor ports that
+reached into private kernel structures stopped working when those changed.
+This port uses only exported interfaces, and differs in these ways:
+
+- **Nested page tables are built by hand** (`port/npt.c`), with 2 MB pages
+  where memory is pinned up front and contiguous.
+- **Guest RAM is the process's own memory**, pinned on first touch, rather
+  than a kernel object mapped into the process.
+- **Host state is saved in a VMCB.** The BSD code restores the task register
+  through the host's GDT; here the host's own VMLOAD/VMSAVE state is parked
+  in a per-CPU control block, which never touches the GDT.
+- **Preemption is held off with a spin lock.** macOS does not export its
+  preemption-disable primitive; holding a spin lock has the same effect.
+- **The vCPU loop is bounded.** macOS cannot be asked whether the scheduler
+  is waiting, so the loop handles at most 32 exits by itself and returns to
+  userland on any host interrupt.
+- **`/dev/nvmm` is a cloning device**, so that each open gets its own minor
+  and machines belong to the open that made them.
+- **Allocation can fail.** The imported code assumed some could not; a guest
+  too large for the host used to panic it and now gets an error.
+
+`diff -ru upstream/sys/dev/virtual/nvmm src` shows every change to the
+imported code. Only the AMD half was imported: there is no Intel support.
+
+## Known issues
+
+- **A 22-second guest stall with four vCPUs.** During a 20-minute load test
+  the guest's watchdog reported two CPUs stuck at the same moment, once. The
+  workload recovered. The cause is not known yet; it may be in `nvmm-run`
+  or in the driver.
+- **Hours old.** Nothing here has run for a day, and several vCPUs in one
+  machine are the newest and least tested part.
+- **One machine, one macOS version.** No Sequoia run of the engine, no
+  other AMD CPU.
+- **Memory on demand has never been loaded**, and memory pinned that way
+  uses 4 KB pages. Pinned memory is not given back while the VM runs.
+- **vmnet did not work** on the test machine in any mode
+  (`vmm/vmnet-probe.c`), so `nvmm-run -n vmnet` is untested and networking
+  goes through gvproxy.
+- **No file sharing**: `docker run -v /a/mac/path:...` has nothing to mount.
+- **Published ports** are forwarded for TCP only.
+- **The APICs are reached through the instruction emulator**, which is slow,
+  and timers are served at about one-millisecond resolution.
+- **Sleep and wake** with a guest running is untested.
+- **Hosts that enable AVX-512 lazily per thread** are not handled.
+- **`/dev/nvmm` is root-only** by default.
+
+## Repository layout
+
+```text
+upstream/   DragonFly BSD's NVMM, pristine, at a pinned commit
+src/        the working copy of those sources, with NVMM_PORT hooks
+port/       the portable OS layer: guest memory, page tables, locks
+darwin/     the macOS kernel extension
+lib/        libnvmm
+vmm/        nvmm-run, nvmm-docker, and the scripts that build the image
+test/       unit, bare-metal, mutation, and on-hardware tests
+tools/      check-kpi.sh, build-qemu.sh, bootstrap-deps.sh
+```
+
+[VISION.md](VISION.md) is about where this could go beyond one machine.
+
+## Resources
+
+- [NVMM on DragonFly BSD](https://www.dragonflybsd.org/docs/docs/howtos/nvmm/):
+  the guide this port's design section follows.
+- [DragonFly's NVMM sources](https://github.com/DragonFlyBSD/DragonFlyBSD/tree/master/sys/dev/virtual/nvmm)
+  and [libnvmm](https://github.com/DragonFlyBSD/DragonFlyBSD/tree/master/lib/libnvmm),
+  which `upstream/` is a copy of.
+- [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock): gvproxy.
+- [The Linux/x86 boot protocol](https://www.kernel.org/doc/html/latest/arch/x86/boot.html),
+  which `nvmm-run` implements the 64-bit entry of.
+- AMD64 Architecture Programmer's Manual, volume 2, chapter 15: Secure
+  Virtual Machine.
 
 ## Licence
 
-Two-clause BSD; see `LICENSE`. The imported files carry their original
-headers. QEMU is not part of this repository and is not distributed with it:
-`tools/build-qemu.sh` downloads it and changes one line of its build.
+Two-clause BSD; see [LICENSE](LICENSE). NVMM is by Maxime Villard and the
+DragonFly Project, and the imported files carry their original headers. QEMU
+and gvproxy are not part of this repository and are not distributed with it.

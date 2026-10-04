@@ -137,6 +137,24 @@ now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/*
+ * Everything a guest waits on goes through this program, so anything here
+ * that takes long freezes the guest for as long. Report it when it happens:
+ * the guest only knows that it lost time, not where.
+ */
+#define STALL_NS	200000000ULL		/* 200 ms */
+
+static void
+stall_check(uint64_t since, const char *what, unsigned long detail)
+{
+	const uint64_t now = now_ns();
+	const uint64_t took = (now > since) ? now - since : 0;
+
+	if (took >= STALL_NS)
+		fprintf(stderr, "\r\n[nvmm-run: %llu ms in %s %#lx]\r\n",
+		    (unsigned long long)(took / 1000000), what, detail);
+}
+
 /* -------------------------------------------------------------------------- */
 /*
  * The interrupt controller: two 8259s, the slave on the master's line 2.
@@ -1138,8 +1156,13 @@ net_finish(struct virtio_dev *d, const uint8_t *mac, char *cmdline,
 static void
 net_wake(void)
 {
+	uint64_t t0 = now_ns();
+
 	pthread_mutex_lock(&big);
+	stall_check(t0, "the network thread waiting for the lock", 0);
+	t0 = now_ns();
 	net_rx(netdev);
+	stall_check(t0, "network receive", 0);
 	pthread_mutex_unlock(&big);
 }
 
@@ -1896,6 +1919,7 @@ static void
 io_callback(struct nvmm_io *io)
 {
 	const uint16_t port = io->port;
+	const uint64_t t0 = now_ns();
 	uint32_t val = 0xFFFFFFFF;
 	uint8_t out = io->data[0];
 
@@ -1952,6 +1976,7 @@ io_callback(struct nvmm_io *io)
 
 	if (io->in)
 		memcpy(io->data, &val, io->size);
+	stall_check(t0, "I/O port", port);
 }
 
 /* Memory the guest touches that is not RAM: the virtio devices. */
@@ -1961,6 +1986,7 @@ mem_callback(struct nvmm_mem *mem)
 	const uint64_t idx = (mem->gpa - VIRTIO_BASE) / VIRTIO_STRIDE;
 	struct cpu *c = (struct cpu *)(void *)((char *)mem->vcpu -
 	    offsetof(struct cpu, vcpu));
+	const uint64_t t0 = now_ns();
 	uint32_t v = 0;
 
 	if (apic_mode && mem->size == 4 &&
@@ -1996,6 +2022,7 @@ mem_callback(struct nvmm_mem *mem)
 			v = virtio_read(&vdevs[idx], off, mem->size);
 			memcpy(mem->data, &v, mem->size);
 		}
+		stall_check(t0, "virtio device at", (unsigned long)mem->gpa);
 		return;
 	}
 
@@ -2282,6 +2309,8 @@ ticker(void *arg)
 		if (pselect(clock_pipe[0] + 1, &rfds, NULL, NULL, &ts,
 		    NULL) > 0 && FD_ISSET(clock_pipe[0], &rfds))
 			(void)read(clock_pipe[0], drain, sizeof(drain));
+		/* Slept far past the deadline: the host held this process. */
+		stall_check(next, "the clock thread oversleeping", 0);
 	}
 
 	pthread_mutex_lock(&big);
@@ -2532,9 +2561,13 @@ cpu_thread(void *arg)
 		clock_rearm(now + CLOCK_SWEEP_NS);
 		c->in_guest = true;
 		pthread_mutex_unlock(&big);
+		now = now_ns();
 		if (nvmm_vcpu_run(&mach, &c->vcpu) == -1 && errno != EINTR)
 			die("cpu %u: vcpu run: %s", c->id, strerror(errno));
+		stall_check(now, "one call into the guest, cpu", c->id);
+		now = now_ns();
 		pthread_mutex_lock(&big);
+		stall_check(now, "waiting for the lock, cpu", c->id);
 		c->in_guest = false;
 		c->nruns++;
 

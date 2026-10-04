@@ -19,9 +19,10 @@ that. macOS on AMD is one such gap. It is not the only one: most small and
 research operating systems are in the same position, and on the BSDs that do
 have NVMM, the only program that drives it is QEMU.
 
-The pieces here are small enough to read. The engine is about 3,000 lines,
-the layer that carries it to a new operating system about 2,000, and the
-program that boots Linux and runs Docker about 2,700. That is the asset: **a
+The pieces here are small enough to read. NVMM's kernel half is about 7,000
+lines and its library 4,600; the layer that carries it to a new operating
+system is about 2,000, and the program that boots Linux and runs Docker
+about 2,800. That is the asset: **a
 complete virtualization stack small enough for one person to understand,
 port and audit**, from the instruction that enters the guest to the socket
 `docker` talks to.
