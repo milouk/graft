@@ -197,7 +197,7 @@ halts. Against it, on a MacBookPro11,1 running macOS 15.7.9:
 
 ## nvmm-run: Docker without QEMU
 
-`vmm/nvmm-run.c` is a virtual machine monitor of about 2,500 lines on
+`vmm/nvmm-run.c` is a virtual machine monitor of about 2,700 lines on
 libnvmm. It loads a Linux kernel directly (no firmware) and gives it a 16550
 serial console, the 8259 interrupt controllers, an 8254 timer, a CMOS clock,
 and virtio block and network devices on the memory-mapped transport. The
