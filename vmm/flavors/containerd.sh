@@ -3,13 +3,20 @@
 # Docker API: nerdctl runs inside the VM, and nothing that wants docker.sock
 # works. There is no BuildKit either, so no "nerdctl build".
 
-FLAVOR_PKGS="containerd containerd-openrc nerdctl cni-plugins iptables"
+FLAVOR_PKGS="containerd containerd-openrc nerdctl cni-plugins iptables crun"
 FLAVOR_BUILD_PKGS="containerd nerdctl cni-plugins iptables"
 FLAVOR_SERVICE=containerd
 FLAVOR_SOCKET=
 FLAVOR_CLI=nerdctl
 
 flavor_setup() {
+	# crun does what runc does, takes the same command line, and is a
+	# twentieth of its size. containerd asks for "runc" by name.
+	rm -f /mnt/usr/bin/runc
+	ln -s crun /mnt/usr/bin/runc
+	# Tools for debugging containerd itself.
+	rm -f /mnt/usr/bin/ctr /mnt/usr/bin/containerd-stress
+
 	# Of the network plugins, only those a single host uses.
 	for f in /mnt/usr/libexec/cni/*; do
 		case "$(basename "$f")" in

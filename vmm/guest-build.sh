@@ -43,8 +43,9 @@ apk --no-progress --root /mnt --initdb \
 step "kernel modules: the ISO's own, less what a VM cannot use"
 mkdir -p /mnt/lib/modules
 cp -a "/.modloop/modules/$KVER" /mnt/lib/modules/
-# Drivers for hardware this machine does not have, and filesystems nobody
-# will put under a container host. Everything a container needs stays.
+# Drivers for hardware this machine does not have, filesystems nobody will
+# put under a container host (NFS among them), and KVM, which has nothing to
+# nest on. Everything a container needs stays.
 K="/mnt/lib/modules/$KVER/kernel"
 rm -rf "$K/sound" "$K/drivers/gpu" "$K/drivers/usb" "$K/drivers/scsi" \
     "$K/drivers/target" "$K/drivers/nvme" "$K/drivers/xen" \
@@ -53,7 +54,10 @@ rm -rf "$K/sound" "$K/drivers/gpu" "$K/drivers/usb" "$K/drivers/scsi" \
     "$K/fs/xfs" "$K/fs/ocfs2" "$K/fs/btrfs" "$K/fs/f2fs" "$K/fs/smb" \
     "$K/fs/ceph" "$K/fs/gfs2" "$K/fs/jfs" "$K/fs/nilfs2" "$K/fs/ntfs3" \
     "$K/fs/udf" "$K/fs/reiserfs" "$K/fs/bcachefs" "$K/net/ceph" \
-    "$K/net/sctp" "$K/net/bluetooth" "$K/net/wireless" "$K/net/mac80211"
+    "$K/net/sctp" "$K/net/bluetooth" "$K/net/wireless" "$K/net/mac80211" \
+    "$K/fs/nfs" "$K/fs/nfsd" "$K/fs/lockd" "$K/fs/nfs_common" \
+    "$K/net/sunrpc" "$K/arch" "$K/drivers/crypto" "$K/drivers/block/drbd" \
+    "$K/drivers/block/rnbd"
 depmod -b /mnt "$KVER"
 
 step "system configuration"

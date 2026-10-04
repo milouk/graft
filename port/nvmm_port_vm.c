@@ -321,12 +321,33 @@ port_prot_to_npt(int prot)
 }
 
 /*
+ * Let go of mappings that port_guest_unmap_locked() took out. This is what
+ * drops the references on the memory behind them, and so what may free or
+ * unpin it; it must wait until no CPU can still be running the guest on a
+ * stale translation, which is after the lock is released and every CPU has
+ * been kicked.
+ */
+static void
+port_guest_reap(struct port_mapping *dead)
+{
+	struct port_mapping *next;
+
+	for (; dead != NULL; dead = next) {
+		next = dead->next;
+		os_vmobj_rel(dead->obj);
+		port_free(dead, sizeof(*dead));
+	}
+}
+
+/*
  * Remove [start, end) from a guest space. A mapping that is only partly
  * covered is trimmed or split, so each surviving piece still holds its own
- * reference on the object behind it. Called with vs->lock held.
+ * reference on the object behind it. Mappings removed whole are put on
+ * '*dead' for port_guest_reap(). Called with vs->lock held.
  */
 static int
-port_guest_unmap_locked(os_vmspace_t *vs, vaddr_t start, vaddr_t end)
+port_guest_unmap_locked(os_vmspace_t *vs, vaddr_t start, vaddr_t end,
+    struct port_mapping **dead)
 {
 	struct port_mapping **mp, *m, *tail;
 
@@ -343,8 +364,8 @@ port_guest_unmap_locked(os_vmspace_t *vs, vaddr_t start, vaddr_t end)
 		if (start <= mstart && end >= mend) {
 			/* Entirely covered. */
 			*mp = m->next;
-			os_vmobj_rel(m->obj);
-			port_free(m, sizeof(*m));
+			m->next = *dead;
+			*dead = m;
 			continue;
 		}
 
@@ -357,6 +378,7 @@ port_guest_unmap_locked(os_vmspace_t *vs, vaddr_t start, vaddr_t end)
 			tail->size = mend - end;
 			tail->obj = m->obj;
 			tail->off = m->off + (end - mstart);
+			tail->prot = m->prot;
 			os_vmobj_ref(tail->obj);
 			tail->next = m->next;
 			m->size = start - mstart;
@@ -417,7 +439,7 @@ static int
 port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
     voff_t off, int prot)
 {
-	struct port_mapping *m;
+	struct port_mapping *m, *dead = NULL;
 	const int nprot = port_prot_to_npt(prot);
 	vsize_t done, step;
 	int error;
@@ -439,10 +461,12 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 	port_mtx_lock(&vs->lock);
 
 	/* A fixed mapping replaces whatever was there. */
-	error = port_guest_unmap_locked(vs, gpa, gpa + size);
+	error = port_guest_unmap_locked(vs, gpa, gpa + size, &dead);
 	if (error != 0) {
 		port_mtx_unlock(&vs->lock);
 		port_free(m, sizeof(*m));
+		os_ipi_kickall();
+		port_guest_reap(dead);
 		return error;
 	}
 
@@ -467,6 +491,7 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 			port_mtx_unlock(&vs->lock);
 			port_free(m, sizeof(*m));
 			os_ipi_kickall();
+			port_guest_reap(dead);
 			return ENOMEM;
 		}
 	}
@@ -482,6 +507,7 @@ port_guest_map(os_vmspace_t *vs, vaddr_t gpa, vsize_t size, os_vmobj_t *obj,
 
 	port_mtx_unlock(&vs->lock);
 	os_ipi_kickall();
+	port_guest_reap(dead);
 	return 0;
 }
 
@@ -553,11 +579,13 @@ os_vmobj_unmap(os_vmmap_t *map, vaddr_t start, vaddr_t end,
 
 	if (map->kind == PORT_SPACE_GUEST) {
 		os_vmspace_t *vs = map->vs;
+		struct port_mapping *dead = NULL;
 
 		port_mtx_lock(&vs->lock);
-		(void)port_guest_unmap_locked(vs, start, end);
+		(void)port_guest_unmap_locked(vs, start, end, &dead);
 		port_mtx_unlock(&vs->lock);
 		os_ipi_kickall();
+		port_guest_reap(dead);
 		return;
 	}
 

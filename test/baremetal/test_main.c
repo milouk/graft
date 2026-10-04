@@ -573,6 +573,12 @@ test_lazy_memory(void)
 	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
 	CHECK_EQ(bare_stats.chunks_pinned, pinned0 + 1);
 
+	/*
+	 * A hole cut below memory not yet touched splits the mapping in
+	 * two. The upper piece is still RAM with the rights it had.
+	 */
+	gpa_unmap(0x40000, 0x1000);
+
 	/* A write across the boundary pins the second, and lands in it. */
 	set_rip(0x4000);
 	(void)run_expect(NVMM_VCPU_EXIT_HALTED);

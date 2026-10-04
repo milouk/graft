@@ -329,7 +329,11 @@ pit_period_ns(const struct pit_chan *c)
 static uint64_t
 pit_ticks(const struct pit_chan *c)
 {
-	return (now_ns() - c->start_ns) * PIT_HZ / 1000000000ULL;
+	const uint64_t ns = now_ns() - c->start_ns;
+
+	/* In two parts: the product of the whole would overflow in hours. */
+	return (ns / 1000000000ULL) * PIT_HZ +
+	    (ns % 1000000000ULL) * PIT_HZ / 1000000000ULL;
 }
 
 static uint16_t
@@ -648,9 +652,15 @@ console_poll(void)
 {
 	uint8_t buf[64];
 	ssize_t n, i;
+	bool full;
 
-	if ((uart.rx_head - uart.rx_tail) > sizeof(uart.rx) - sizeof(buf))
-		return;
+	/*
+	 * Keep reading even when the guest is not: the escape sequence has
+	 * to work on a guest that has stopped listening, and input left
+	 * unread would keep waking the clock thread. What does not fit is
+	 * dropped, as a real serial port would.
+	 */
+	full = (uart.rx_head - uart.rx_tail) > sizeof(uart.rx) - sizeof(buf);
 	n = read(STDIN_FILENO, buf, sizeof(buf));
 	if (n == 0)
 		console_eof = true;	/* nothing more will ever come */
@@ -667,7 +677,8 @@ console_poll(void)
 			escape_seen = true;
 			continue;
 		}
-		uart.rx[uart.rx_head++ % sizeof(uart.rx)] = buf[i];
+		if (!full)
+			uart.rx[uart.rx_head++ % sizeof(uart.rx)] = buf[i];
 	}
 	if (n > 0)
 		uart_update_irq();
@@ -781,7 +792,7 @@ vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
 	unsigned int n = 0;
 	uint16_t i;
 
-	if (!q->ready || avail == NULL || desc == NULL)
+	if (!q->ready || q->num == 0 || avail == NULL || desc == NULL)
 		return -1;
 	if (q->last_avail == avail[1])
 		return 0;
@@ -789,21 +800,28 @@ vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
 	*head = i = avail[2 + (q->last_avail % q->num)];
 	*nout = 0;
 	for (;;) {
+		struct vq_desc d;
+
 		if (i >= q->num || n == VQ_IOV_MAX)
 			return -1;
-		iov[n].iov_base = gpa_ptr(desc[i].addr, desc[i].len);
-		iov[n].iov_len = desc[i].len;
+		/*
+		 * A copy: the guest's other CPUs can rewrite the descriptor
+		 * between a check of it and its use.
+		 */
+		memcpy(&d, &desc[i], sizeof(d));
+		iov[n].iov_base = gpa_ptr(d.addr, d.len);
+		iov[n].iov_len = d.len;
 		if (iov[n].iov_base == NULL)
 			return -1;
-		if ((desc[i].flags & VQ_DESC_F_WRITE) == 0) {
+		if ((d.flags & VQ_DESC_F_WRITE) == 0) {
 			if (*nout != n)
 				return -1;	/* readable after writable */
 			(*nout)++;
 		}
 		n++;
-		if ((desc[i].flags & VQ_DESC_F_NEXT) == 0)
+		if ((d.flags & VQ_DESC_F_NEXT) == 0)
 			break;
-		i = desc[i].next;
+		i = d.next;
 	}
 	q->last_avail++;
 	return (int)n;
@@ -817,7 +835,7 @@ vq_push(struct virtio_dev *d, struct virtq *q, uint16_t head, uint32_t len)
 	const uint16_t *avail = gpa_ptr(q->avail, 4);
 	uint32_t *elem;
 
-	if (used == NULL || avail == NULL)
+	if (used == NULL || avail == NULL || q->num == 0)
 		return;
 	elem = (uint32_t *)(void *)(used + 2) + 2 * (used[1] % q->num);
 	elem[0] = head;
@@ -885,7 +903,11 @@ virtio_write(struct virtio_dev *d, uint64_t off, uint32_t v)
 		break;
 	case 0x024: d->driver_sel = v; break;
 	case 0x030: d->queue_sel = v; break;
-	case 0x038: q->num = (v <= VQ_MAX) ? v : 0; break;
+	case 0x038:
+		/* Fixed once the queue is in use: its size is divided by. */
+		if (!q->ready)
+			q->num = (v <= VQ_MAX) ? v : 0;
+		break;
 	case 0x044: q->ready = (v & 1) && q->num != 0; break;
 	case 0x050:
 		if (v < 2 && d->vq[v].ready)
@@ -1208,6 +1230,9 @@ static void
 net_wake(void)
 {
 	uint64_t t0 = now_ns();
+
+	if (netdev == NULL)
+		return;		/* a frame before the card exists */
 
 	pthread_mutex_lock(&big);
 	stall_check(t0, "the network thread waiting for the lock", 0);
@@ -2165,6 +2190,8 @@ load_linux(const char *kpath, const char *ipath, const char *cmdline)
 
 	if (ipath != NULL) {
 		initrd = read_file(ipath, &isize);
+		if (isize >= ram_size)
+			die("initramfs does not fit in guest memory");
 		initrd_gpa = (ram_size - isize) & ~0xFFFULL;
 		if (initrd_gpa < load + init_size)
 			die("initramfs does not fit in guest memory");
@@ -2777,6 +2804,8 @@ main(int argc, char **argv)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = kick_handler;
 	sigaction(SIGUSR1, &sa, NULL);
+	/* A network helper that goes away is an error on write, not a death. */
+	signal(SIGPIPE, SIG_IGN);
 
 	if (dpath != NULL)
 		blk_add(dpath, cmdline, sizeof(cmdline));

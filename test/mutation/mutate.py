@@ -44,6 +44,8 @@ MUTATIONS = [
     ("lazy memory: the whole buffer pinned at the first touch", "port/nvmm_port_vm.c",
      "\tcend = coff + PORT_LAZY_CHUNK;\n\tif (coff < m->off)\n\t\tcoff = m->off;\n\tif (cend > m->off + m->size)\n\t\tcend = m->off + m->size;",
      "\tcoff = m->off;\n\tcend = m->off + m->size;"),
+    ("guest memory: a split mapping's upper piece loses its rights", "port/nvmm_port_vm.c",
+     "\t\t\ttail->prot = m->prot;\n", ""),
     ("guest memory: read-only mapped writable", "port/nvmm_port_vm.c",
      "\tif (prot & PROT_WRITE)\n\t\tnprot |= NPT_PROT_WRITE;",
      "\tnprot |= NPT_PROT_WRITE;"),

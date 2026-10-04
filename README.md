@@ -315,6 +315,7 @@ the tests can fail.
 ```mermaid
 flowchart TB
     subgraph any["On any Mac, with Docker"]
+        img["Image test<br/>build an image, boot it under emulation,<br/>run a container"]
         unit["Unit test<br/>nested page tables"]
         bare["Test kernel under QEMU's emulated AMD-V<br/>the real engine and port layer"]
         mut["Mutation run<br/>deliberate bugs, each must be caught"]
@@ -325,7 +326,7 @@ flowchart TB
     end
     subgraph amd["On an AMD Mac"]
         gt["nvmm-guest-test<br/>real guests, in stages"]
-        dt["docker-test<br/>Linux and Docker, QEMU or nvmm-run"]
+        dt["vmm/test.sh<br/>containers in the VM, from the Mac"]
     end
     unit --> bare --> mut
     bare --> self --> gt --> dt
@@ -335,6 +336,8 @@ flowchart TB
 ```sh
 make check                  # unit test, emulator suite, kext build
 ./test/mutation/mutate.py   # slow: one rebuild and run per bug
+./test/image/run.sh         # slow: build and boot an image of each flavour
+vmm/test.sh                 # on the AMD Mac: the VM, end to end
 ```
 
 What emulation cannot show, and the first real machine had to: whether a
