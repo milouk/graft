@@ -84,8 +84,7 @@ flowchart TB
     dockerd --> ctr
 ```
 
-The kernel extension is four layers, and there are two pieces of userland.
-Three of the six are new:
+Two of the five pieces are imported from DragonFly BSD, and three are new:
 
 | Layer | Lines | Origin |
 | --- | --- | --- |
