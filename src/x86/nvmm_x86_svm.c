@@ -502,6 +502,8 @@ static struct svm_hsave *hsave;
 #if defined(NVMM_PORT)
 /* One page per host CPU: VMSAVE/VMLOAD target for the host's own state. */
 static struct svm_hsave *svm_hostvmcb;
+/* Set while the host has SVM switched off around sleep. */
+static volatile bool svm_suspended;
 #endif
 
 static uint8_t *svm_asidmap __read_mostly;
@@ -1794,6 +1796,15 @@ svm_vcpu_run(struct nvmm_machine *mach, struct nvmm_cpu *vcpu,
 		svm_clgi();
 		machgen = svm_htlb_flush(mach, cpudata);
 
+#if defined(NVMM_PORT)
+		if (__predict_false(svm_suspended)) {
+			/* No hTLB flush ack, because it's not executed. */
+			svm_stgi();
+			exit->reason = NVMM_VCPU_EXIT_NONE;
+			break;
+		}
+#endif
+
 #ifdef __DragonFly__
 		/*
 		 * Check for pending host events (e.g., interrupt, AST)
@@ -2971,6 +2982,33 @@ svm_init(void)
 
 	os_ipi_broadcast(svm_change_cpu, (void *)true);
 }
+
+#if defined(NVMM_PORT)
+/*
+ * A CPU returns from sleep with EFER.SVME clear and VM_HSAVE_PA forgotten.
+ * The host calls these around sleep so that SVM is switched off cleanly and
+ * back on afterwards. Guests do not survive the trip.
+ */
+void
+nvmm_port_suspend(void)
+{
+	/*
+	 * Raise the flag first. A vCPU loop checks it with GIF clear, so it
+	 * either sees the flag and backs out, or is already committed to a
+	 * VMRUN that the broadcast below immediately interrupts; either way it
+	 * never executes VMRUN with SVM switched off.
+	 */
+	svm_suspended = true;
+	os_ipi_broadcast(svm_change_cpu, (void *)false);
+}
+
+void
+nvmm_port_resume(void)
+{
+	os_ipi_broadcast(svm_change_cpu, (void *)true);
+	svm_suspended = false;
+}
+#endif
 
 static void
 svm_fini_asid(void)

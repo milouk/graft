@@ -52,7 +52,21 @@ MUTATIONS = [
      "\tx86_set_dr7(pc->dr7);\n}", "}"),
     ("debug registers: DR0 not restored", "port/nvmm_port_x86.h",
      "\tx86_set_dr0(pc->dr[0]);\n\tx86_set_dr1(pc->dr[1]);", "\tx86_set_dr1(pc->dr[1]);"),
-    ("engine: address-space generation ignored", "src/x86/nvmm_x86_svm.c",
+    ("sleep/wake: vCPU allowed to run while suspended", "src/x86/nvmm_x86_svm.c",
+     "\t\tif (__predict_false(svm_suspended)) {", "\t\tif (0) {"),
+    ("sleep/wake: SVM not re-enabled on resume", "src/x86/nvmm_x86_svm.c",
+     "\tos_ipi_broadcast(svm_change_cpu, (void *)true);\n\tsvm_suspended = false;",
+     "\tsvm_suspended = false;"),
+]
+
+# Bugs the emulator cannot reveal. They are run anyway, so that this list is
+# kept honest: if one of them starts being detected, it should move up.
+KNOWN_BLIND = [
+    # QEMU's software AMD-V flushes its translation cache on every world
+    # switch, so a guest never sees a stale mapping even if the engine forgets
+    # to ask for a TLB flush. Only real hardware can show this one.
+    ("engine: address-space generation ignored (TLB flush skipped)",
+     "src/x86/nvmm_x86_svm.c",
      "\tmachgen = os_vmspace_gen(mach->vm);", "\tmachgen = cpudata->vcpu_htlb_gen;"),
 ]
 
@@ -81,7 +95,8 @@ def main():
         sys.exit("refusing to run: src/ or port/ has uncommitted changes:\n" + dirty)
 
     undetected = invalid = 0
-    for name, path, old, new in MUTATIONS:
+    for name, path, old, new in MUTATIONS + KNOWN_BLIND:
+        blind = (name, path, old, new) in KNOWN_BLIND
         src = open(path).read()
         if src.count(old) != 1:
             print(f"INVALID       {name}: pattern found {src.count(old)} times")
@@ -95,15 +110,21 @@ def main():
         if passed is None:
             print(f"INVALID       {name}: {detail}")
             invalid += 1
+        elif passed and blind:
+            print(f"blind spot    {name}", flush=True)
         elif passed:
             print(f"NOT DETECTED  {name}", flush=True)
             undetected += 1
+        elif blind:
+            print(f"now detected  {name}: move it out of KNOWN_BLIND", flush=True)
         else:
             print(f"detected      {name}: {detail}", flush=True)
 
     passed, detail = run_tests()
     print("unmutated tree:", "PASS" if passed else f"FAIL ({detail})")
-    print(f"{len(MUTATIONS) - undetected - invalid} detected, {undetected} not detected, {invalid} invalid")
+    print(f"{len(MUTATIONS) - undetected - invalid} of {len(MUTATIONS)} detected, "
+          f"{undetected} not detected, {invalid} invalid, "
+          f"{len(KNOWN_BLIND)} known blind spot(s)")
     sys.exit(0 if passed and undetected == 0 and invalid == 0 else 1)
 
 

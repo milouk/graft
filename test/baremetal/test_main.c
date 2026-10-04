@@ -477,6 +477,44 @@ test_return_needed(void)
 	CHECK(!port_preempt_disabled());
 }
 
+/*
+ * What the host does around sleep: SVM is switched off on every CPU and back
+ * on again. Afterwards the engine must still be able to run a guest.
+ */
+static void
+test_suspend_resume(void)
+{
+	static const uint8_t code[] = {
+		0xB0, 0x99,	/* mov $0x99,%al */
+		0xF4,		/* hlt           */
+	};
+	const uint32_t msr_hsave_pa = 0xC0010117;
+
+	CHECK((rdmsr(MSR_EFER) & EFER_SVME) != 0);
+	CHECK(rdmsr(msr_hsave_pa) != 0);
+
+	load(0x6000, code, sizeof(code));
+	set_rip(0x6000);
+
+	nvmm_port_suspend();
+	CHECK((rdmsr(MSR_EFER) & EFER_SVME) == 0);
+	CHECK_EQ(rdmsr(msr_hsave_pa), 0);
+
+	/*
+	 * Asking to run a guest now must be refused quietly. Executing VMRUN
+	 * with SVM off raises #UD, which would stop this kernel with a trap.
+	 */
+	(void)run_expect(NVMM_VCPU_EXIT_NONE);
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RIP), 0x6000);
+
+	nvmm_port_resume();
+	CHECK((rdmsr(MSR_EFER) & EFER_SVME) != 0);
+	CHECK(rdmsr(msr_hsave_pa) != 0);
+
+	(void)run_expect(NVMM_VCPU_EXIT_HALTED);
+	CHECK_EQ(get_gpr(NVMM_X64_GPR_RAX) & 0xFF, 0x99);
+}
+
 static void
 test_teardown(void)
 {
@@ -552,6 +590,7 @@ kmain(void)
 		RUN(test_cpuid);
 		RUN(test_fpu);
 		RUN(test_return_needed);
+		RUN(test_suspend_resume);
 		RUN(test_teardown);
 	}
 

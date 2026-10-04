@@ -27,7 +27,12 @@
 /* -------------------------------------------------------------------------- */
 /* Types. */
 
-typedef uintptr_t	vaddr_t;
+/*
+ * 64-bit by definition rather than uintptr_t: the core passes guest-physical
+ * addresses (uint64_t) where a vaddr_t is expected, and on macOS those are
+ * different types even though they are the same size.
+ */
+typedef uint64_t	vaddr_t;
 typedef uint64_t	voff_t;
 typedef size_t		vsize_t;
 typedef uint64_t	paddr_t;
@@ -290,6 +295,13 @@ int		os_contigpa_zalloc(paddr_t *, vaddr_t *, size_t);
 void		os_contigpa_free(paddr_t, vaddr_t, size_t);
 
 time_t		os_time(void);
+
+/*
+ * Turn hardware virtualization off and on again on every CPU, for the host's
+ * sleep and wake. Implemented by the engine.
+ */
+void		nvmm_port_suspend(void);
+void		nvmm_port_resume(void);
 
 /* One-time setup and teardown of this layer's own state. */
 void		port_init(void);

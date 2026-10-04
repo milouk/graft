@@ -36,6 +36,13 @@
 #include <stdbool.h>
 #endif
 
+#if defined(NVMM_PORT)
+/* Not every kernel's <sys/types.h> brings these in. */
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#endif
+
 typedef uint64_t	gpaddr_t;
 typedef uint64_t	gvaddr_t;
 

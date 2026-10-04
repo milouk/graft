@@ -69,9 +69,11 @@ KEXT_DIR	:= $(BUILD)/kext
 KEXT_BUNDLE	:= $(BUILD)/NVMM.kext
 KEXT_COMMON	:= -arch x86_64 -mkernel -nostdinc -fno-builtin \
 		   -fno-stack-protector -mmacosx-version-min=10.15 \
-		   -isysroot $(SDK) -I$(KHDR) -I$(SDK)/usr/include \
+		   -isysroot $(SDK) -isystem $(KHDR) \
 		   -DKERNEL -DKERNEL_PRIVATE -D_KERNEL -DAPPLE -DNeXT \
-		   -DNVMM_PORT $(COMMON_INC) -Idarwin -O2 -g $(WARN) -Werror
+		   -DNVMM_PORT $(COMMON_INC) -Idarwin -O2 -g $(WARN) -Werror \
+		   -Wno-shorten-64-to-32 -Wno-sign-conversion \
+		   -Wno-implicit-int-conversion
 KEXT_CFLAGS	:= $(KEXT_COMMON) -std=gnu11
 KEXT_CXXFLAGS	:= $(KEXT_COMMON) -std=gnu++17 -fno-exceptions -fno-rtti \
 		   -fapple-kext -fno-threadsafe-statics
