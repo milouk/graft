@@ -110,6 +110,10 @@ and debug-register parking, mappings into a process (anywhere and at a fixed
 address), cleanup after a process that exits without unmapping, and that the
 device node survives being looked up hundreds of times.
 
+On a MacBookPro11,1 running macOS 15.7.9 it passes 47 in-kernel checks and
+all process-side checks, repeatedly, with no growth in IOKit object counts,
+and again after a real sleep and wake (both notifications are delivered).
+
 Running it on a real machine found two bugs that emulation could not:
 
 - **The device node.** devfs calls a cloning device's clone function on every
@@ -150,8 +154,9 @@ The first thing to exercise after that is a userland port of the checks in
 ## Known gaps
 
 - `libnvmm` and the QEMU build are not done, so nothing can use the driver yet.
-- Sleep and wake are handled in code and tested under emulation, but untested
-  on a real host.
+- Sleep and wake: the notifications arrive and the glue survives a cycle on
+  real hardware, and the engine's suspend path is tested under emulation, but
+  the two have not been tested together, and never with a guest running.
 - Hosts that enable AVX-512 lazily per thread (not AMD Zen or Zen+) are not
   handled: the engine assumes one host XCR0.
 - `/dev/nvmm` is root-only.
