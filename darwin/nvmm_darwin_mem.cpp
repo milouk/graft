@@ -5,8 +5,6 @@
  * wired memory whose physical addresses it may know, and to map that memory
  * into a process. Nothing here depends on the layout of a private kernel
  * structure, which is what broke earlier hypervisor ports to macOS.
- *
- * STATUS: runs on real hardware (macOS 15, Intel) under the self-test.
  */
 
 #include <IOKit/IOLib.h>

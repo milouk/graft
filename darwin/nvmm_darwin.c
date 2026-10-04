@@ -10,8 +10,6 @@
  * Only interfaces macOS exports to kernel extensions are used. The export
  * lists for macOS 15 were checked symbol by symbol; tools/check-kpi.sh repeats
  * that check against a built kext.
- *
- * STATUS: this file compiles and links. It has never been loaded.
  */
 
 #include "nvmm.h"
