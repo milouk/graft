@@ -1,0 +1,4 @@
+Source: https://github.com/DragonFlyBSD/DragonFlyBSD
+Commit: 97960b5b55906e0767b5819a1fbc614863ad3a8a
+Fetched: 2026-10-04
+Paths: sys/dev/virtual/nvmm (AMD/SVM half only; VMX files not imported), lib/libnvmm
