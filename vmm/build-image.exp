@@ -1,0 +1,106 @@
+#!/usr/bin/expect -f
+#
+# build-image.exp — make what nvmm-run boots: a root filesystem image
+# (Alpine Linux with Docker and two container images) and an initramfs
+# that can mount it.
+#
+#   ./build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>
+#
+# This is a build tool, not part of running a VM. It boots the Alpine ISO in
+# QEMU and runs vmm/guest-build.sh inside it. The script reaches the guest as
+# a disk, and the initramfs comes back out through another, because the host
+# cannot read a Linux filesystem; so the only thing typed at the guest is a
+# login and one command.
+#
+# QEMU's software emulation is the default: no driver, no root, a quarter of
+# an hour. ACCEL=nvmm in the environment takes a minute or two. SIZE sets the
+# size of the root filesystem (default 4G). The Alpine release in
+# guest-build.sh must match the ISO, whose kernel modules the image uses;
+# nvmm-run must then boot that same kernel (the ISO's boot/vmlinuz-virt).
+
+if {$argc != 3} {
+    puts "usage: build-image.exp <qemu-system-x86_64> <alpine-virt.iso> <output dir>"
+    exit 2
+}
+lassign $argv qemu iso outdir
+
+# Read the console as bytes: a multi-byte character split across two reads
+# otherwise fails the read, and Expect takes that for the end of the console.
+encoding system iso8859-1
+
+set accel tcg
+if {[info exists env(ACCEL)]} { set accel $env(ACCEL) }
+set size 4G
+if {[info exists env(SIZE)]} { set size $env(SIZE) }
+
+set outdir [file normalize $outdir]
+set here [file dirname [file normalize [info script]]]
+set rootfs $outdir/rootfs.img
+set initramfs $outdir/initramfs-nvmm
+set script $outdir/build-script.img
+set scratch $outdir/build-scratch.img
+set sock $outdir/build-serial.sock
+set qerr $outdir/build-qemu.err
+set qimg [file dirname $qemu]/qemu-img
+file mkdir $outdir
+file delete -force $sock $rootfs $script $scratch
+
+exec $qimg create -f raw $rootfs $size
+exec $qimg create -f raw $scratch 64M
+# The script, padded to a whole number of sectors with newlines.
+exec sh -c "cat '$here/guest-build.sh' > '$script'; \
+    n=\$(wc -c < '$script'); pad=\$(( (512 - n % 512) % 512 + 512 )); \
+    awk -v n=\$pad 'BEGIN { for (i = 0; i < n; i++) printf \"\\n\" }' >> '$script'"
+
+set qpid [exec $qemu -accel $accel -M q35 -m 2G -display none \
+    -monitor none -serial unix:$sock,server=on,wait=off -cdrom $iso \
+    -drive file=$rootfs,if=virtio,format=raw \
+    -drive file=$script,if=virtio,format=raw,readonly=on \
+    -drive file=$scratch,if=virtio,format=raw \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    < /dev/null > $qerr 2>@1 &]
+for {set i 0} {$i < 50 && ![file exists $sock]} {incr i} { after 100 }
+if {![file exists $sock]} { puts "### QEMU did not start; see $qerr"; exit 1 }
+
+proc fail {msg} {
+    global qpid
+    puts "\n### $msg"
+    catch {exec kill $qpid}
+    exit 1
+}
+
+set timeout 300
+spawn nc -U $sock
+expect {
+    "login: " {}
+    timeout { fail "TIMEOUT waiting for the login prompt" }
+}
+send "root\r"
+expect "localhost:~# "
+# Let the shell finish asking the terminal where its cursor is; typing
+# into the middle of that can lose keystrokes.
+after 2000
+send "sh /dev/vdb\r"
+
+set isize 0
+set timeout 3600
+expect {
+    -re {@@INITRAMFS-SIZE:([0-9]+)@@} { set isize $expect_out(1,string); exp_continue }
+    -re {@@RESULT:([0-9]+)@@} {
+        if {$expect_out(1,string) != 0} { fail "the build failed inside the guest" }
+    }
+    timeout { fail "TIMEOUT during the build" }
+    eof { fail "CONSOLE CLOSED during the build" }
+}
+
+expect "localhost:~# "
+after 2000
+send "poweroff\r"
+set timeout 120
+expect eof
+for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
+
+if {$isize <= 0} { puts "### no initramfs size reported"; exit 1 }
+exec head -c $isize $scratch > $initramfs
+file delete -force $script $scratch $sock
+puts "\n### built $rootfs and $initramfs ($isize bytes)"

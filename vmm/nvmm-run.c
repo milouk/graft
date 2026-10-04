@@ -8,8 +8,17 @@
  * this small: NVMM leaves every device to userland, and the local APIC is by
  * far the largest of them.
  *
+ * A disk, if given, is a virtio block device: the kernel finds it through
+ * its command line, which is how virtio's memory-mapped transport is used
+ * on machines with no firmware tables to describe it.
+ *
+ * A network card, if asked for (-n), is a virtio one on macOS's own vmnet:
+ * the guest gets an address by DHCP and reaches the outside through the
+ * host, with nothing to configure. vmnet needs root.
+ *
  * Usage (needs /dev/nvmm):
- *   nvmm-run -k vmlinuz [-i initramfs] [-m megabytes] [-a "extra cmdline"]
+ *   nvmm-run -k vmlinuz [-i initramfs] [-d disk.img] [-n] [-m megabytes]
+ *            [-a "extra cmdline"]
  *
  * The console is this terminal. Ctrl-A then x quits.
  */
@@ -18,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -30,6 +40,9 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <dispatch/dispatch.h>
+#include <vmnet/vmnet.h>
 
 #include <nvmm.h>
 
@@ -598,6 +611,505 @@ cmos_read(void)
 	}
 }
 
+
+/* -------------------------------------------------------------------------- */
+/*
+ * Virtio devices on the memory-mapped transport (virtio 1.x, "version 2"),
+ * with split virtqueues. The guest's memory is ours too, so a queue is just
+ * read where it lies.
+ */
+
+#define VIRTIO_BASE	0xD0000000ULL
+#define VIRTIO_STRIDE	0x1000ULL
+#define VIRTIO_MAXDEV	4
+#define VQ_MAX		256
+#define VQ_IOV_MAX	(VQ_MAX + 2)
+
+#define VIRTIO_F_VERSION_1	(1ULL << 32)
+#define VIRTIO_ID_NET		1
+#define VIRTIO_ID_BLOCK		2
+
+struct virtq {
+	uint32_t num;
+	bool ready;
+	uint64_t desc, avail, used;
+	uint16_t last_avail;
+};
+
+struct virtio_dev {
+	uint32_t id;
+	int irq;
+	uint64_t features, driver_features;
+	uint32_t features_sel, driver_sel, queue_sel;
+	uint32_t status, isr;
+	struct virtq vq[2];
+	uint8_t config[64];
+	void (*notify)(struct virtio_dev *, unsigned int);
+	int fd;				/* block: the image */
+	interface_ref iface;		/* network: the vmnet interface */
+	size_t max_packet;
+};
+
+static struct virtio_dev vdevs[VIRTIO_MAXDEV];
+static unsigned int nvdevs;
+
+/* Guest memory, bounds checked. NULL if any of it is not RAM. */
+static void *
+gpa_ptr(uint64_t gpa, uint64_t len)
+{
+	if (gpa >= ram_size || len > ram_size - gpa)
+		return NULL;
+	return ram + gpa;
+}
+
+struct vq_desc {
+	uint64_t addr;
+	uint32_t len;
+	uint16_t flags;
+	uint16_t next;
+};
+#define VQ_DESC_F_NEXT	1
+#define VQ_DESC_F_WRITE	2
+
+/*
+ * Take the next request off a queue: its buffers in 'iov', the first 'nout'
+ * of them for the device to read, the rest to write. Returns the number of
+ * buffers, 0 if the queue is empty, -1 if the guest handed over nonsense.
+ */
+static int
+vq_pop(struct virtq *q, struct iovec *iov, unsigned int *nout, uint16_t *head)
+{
+	const uint16_t *avail = gpa_ptr(q->avail, 4 + 2 * (uint64_t)q->num);
+	const struct vq_desc *desc = gpa_ptr(q->desc, 16 * (uint64_t)q->num);
+	unsigned int n = 0;
+	uint16_t i;
+
+	if (!q->ready || avail == NULL || desc == NULL)
+		return -1;
+	if (q->last_avail == avail[1])
+		return 0;
+
+	*head = i = avail[2 + (q->last_avail % q->num)];
+	*nout = 0;
+	for (;;) {
+		if (i >= q->num || n == VQ_IOV_MAX)
+			return -1;
+		iov[n].iov_base = gpa_ptr(desc[i].addr, desc[i].len);
+		iov[n].iov_len = desc[i].len;
+		if (iov[n].iov_base == NULL)
+			return -1;
+		if ((desc[i].flags & VQ_DESC_F_WRITE) == 0) {
+			if (*nout != n)
+				return -1;	/* readable after writable */
+			(*nout)++;
+		}
+		n++;
+		if ((desc[i].flags & VQ_DESC_F_NEXT) == 0)
+			break;
+		i = desc[i].next;
+	}
+	q->last_avail++;
+	return (int)n;
+}
+
+/* Hand a request back, 'len' bytes of it written by the device. */
+static void
+vq_push(struct virtio_dev *d, struct virtq *q, uint16_t head, uint32_t len)
+{
+	uint16_t *used = gpa_ptr(q->used, 4 + 8 * (uint64_t)q->num);
+	const uint16_t *avail = gpa_ptr(q->avail, 4);
+	uint32_t *elem;
+
+	if (used == NULL || avail == NULL)
+		return;
+	elem = (uint32_t *)(void *)(used + 2) + 2 * (used[1] % q->num);
+	elem[0] = head;
+	elem[1] = len;
+	__sync_synchronize();
+	used[1]++;
+
+	d->isr |= 1;
+	if ((avail[0] & 1) == 0)		/* guest wants interrupts */
+		irq_raise(d->irq);
+}
+
+static void
+virtio_reset(struct virtio_dev *d)
+{
+	memset(d->vq, 0, sizeof(d->vq));
+	d->status = 0;
+	d->isr = 0;
+	d->driver_features = 0;
+	d->features_sel = d->driver_sel = d->queue_sel = 0;
+}
+
+static uint32_t
+virtio_read(struct virtio_dev *d, uint64_t off, size_t size)
+{
+	const struct virtq *q = &d->vq[d->queue_sel & 1];
+	uint32_t v = 0;
+
+	if (off >= 0x100) {
+		if (off - 0x100 + size <= sizeof(d->config))
+			memcpy(&v, d->config + (off - 0x100), size);
+		return v;
+	}
+	switch (off) {
+	case 0x000: return 0x74726976;		/* "virt" */
+	case 0x004: return 2;
+	case 0x008: return d->id;
+	case 0x00C: return 0x4D4D564E;		/* "NVMM" */
+	case 0x010:
+		return (uint32_t)(d->features >> (d->features_sel ? 32 : 0));
+	case 0x034: return d->queue_sel < 2 ? VQ_MAX : 0;
+	case 0x044: return q->ready;
+	case 0x060: return d->isr;
+	case 0x070: return d->status;
+	case 0x0FC: return 0;
+	default:    return 0;
+	}
+}
+
+static void
+virtio_write(struct virtio_dev *d, uint64_t off, uint32_t v)
+{
+	struct virtq *q = &d->vq[d->queue_sel & 1];
+
+	switch (off) {
+	case 0x014: d->features_sel = v; break;
+	case 0x020:
+		if (d->driver_sel)
+			d->driver_features = (d->driver_features &
+			    0xFFFFFFFFULL) | ((uint64_t)v << 32);
+		else
+			d->driver_features = (d->driver_features &
+			    ~0xFFFFFFFFULL) | v;
+		break;
+	case 0x024: d->driver_sel = v; break;
+	case 0x030: d->queue_sel = v; break;
+	case 0x038: q->num = (v <= VQ_MAX) ? v : 0; break;
+	case 0x044: q->ready = (v & 1) && q->num != 0; break;
+	case 0x050:
+		if (v < 2 && d->vq[v].ready)
+			d->notify(d, v);
+		break;
+	case 0x064: d->isr &= ~v; break;
+	case 0x070:
+		if (v == 0)
+			virtio_reset(d);
+		else
+			d->status = v;
+		break;
+	case 0x080: q->desc = (q->desc & ~0xFFFFFFFFULL) | v; break;
+	case 0x084: q->desc = (q->desc & 0xFFFFFFFFULL) | ((uint64_t)v << 32); break;
+	case 0x090: q->avail = (q->avail & ~0xFFFFFFFFULL) | v; break;
+	case 0x094: q->avail = (q->avail & 0xFFFFFFFFULL) | ((uint64_t)v << 32); break;
+	case 0x0A0: q->used = (q->used & ~0xFFFFFFFFULL) | v; break;
+	case 0x0A4: q->used = (q->used & 0xFFFFFFFFULL) | ((uint64_t)v << 32); break;
+	}
+}
+
+/* ---- the block device ---- */
+
+#define VIRTIO_BLK_F_SEG_MAX	(1ULL << 2)
+#define VIRTIO_BLK_F_FLUSH	(1ULL << 9)
+#define BLK_SEG_MAX		126
+
+/*
+ * Read or write a run of buffers at an offset. macOS has preadv() only from
+ * version 11, so it is done one buffer at a time. Returns bytes moved, or -1.
+ */
+static ssize_t
+blk_rw(int fd, bool wr, const struct iovec *iov, int n, off_t off)
+{
+	ssize_t total = 0, r;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		size_t done = 0;
+
+		while (done < iov[i].iov_len) {
+			char *p = (char *)iov[i].iov_base + done;
+			const size_t left = iov[i].iov_len - done;
+
+			r = wr ? pwrite(fd, p, left, off) :
+			    pread(fd, p, left, off);
+			if (r < 0 && errno == EINTR)
+				continue;
+			if (r <= 0)
+				return -1;	/* error, or past the end */
+			done += (size_t)r;
+			off += r;
+			total += r;
+		}
+	}
+	return total;
+}
+
+static void
+blk_notify(struct virtio_dev *d, unsigned int qi)
+{
+	static struct iovec iov[VQ_IOV_MAX];
+	struct virtq *q = &d->vq[qi];
+	unsigned int nout;
+	uint16_t head;
+	int n;
+
+	while ((n = vq_pop(q, iov, &nout, &head)) > 0) {
+		struct { uint32_t type, rsvd; uint64_t sector; } hdr;
+		uint8_t *status;
+		uint32_t written = 1;
+		ssize_t r = 0;
+
+		/* A header to read, a status byte to write, data between. */
+		if (nout < 1 || iov[0].iov_len != sizeof(hdr) ||
+		    (unsigned int)n == nout || iov[n - 1].iov_len != 1) {
+			vq_push(d, q, head, 0);
+			continue;
+		}
+		memcpy(&hdr, iov[0].iov_base, sizeof(hdr));
+		status = iov[n - 1].iov_base;
+
+		switch (hdr.type) {
+		case 0:					/* read */
+			r = blk_rw(d->fd, false, iov + nout, n - 1 - (int)nout,
+			    (off_t)(hdr.sector * 512));
+			if (r >= 0)
+				written += (uint32_t)r;
+			break;
+		case 1:					/* write */
+			r = blk_rw(d->fd, true, iov + 1, (int)nout - 1,
+			    (off_t)(hdr.sector * 512));
+			break;
+		case 4:					/* flush */
+			r = fsync(d->fd);
+			break;
+		case 8:					/* identify */
+			if ((unsigned int)n - nout == 2 &&
+			    iov[nout].iov_len >= 20) {
+				memset(iov[nout].iov_base, 0, 20);
+				memcpy(iov[nout].iov_base, "nvmm-run", 8);
+				written += 20;
+			}
+			break;
+		default:
+			r = -2;
+			break;
+		}
+		*status = (r == -2) ? 2 : (r < 0) ? 1 : 0;
+		vq_push(d, q, head, written);
+	}
+	if (n < 0)
+		fprintf(stderr, "[virtio-blk: bad request from the guest]\r\n");
+}
+
+/* Returns the kernel command line fragment that announces the device. */
+static void
+blk_add(const char *path, char *cmdline, size_t cmdlen)
+{
+	struct virtio_dev *d = &vdevs[nvdevs];
+	struct stat st;
+	uint64_t sectors;
+	uint32_t seg_max = BLK_SEG_MAX;
+
+	d->fd = open(path, O_RDWR);
+	if (d->fd == -1 || fstat(d->fd, &st) == -1)
+		die("%s: %s", path, strerror(errno));
+	sectors = (uint64_t)st.st_size / 512;
+
+	d->id = VIRTIO_ID_BLOCK;
+	d->irq = 5 + (int)nvdevs;
+	d->features = VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX |
+	    VIRTIO_BLK_F_FLUSH;
+	d->notify = blk_notify;
+	memcpy(d->config, &sectors, 8);
+	memcpy(d->config + 12, &seg_max, 4);
+
+	snprintf(cmdline + strlen(cmdline), cmdlen - strlen(cmdline),
+	    " virtio_mmio.device=4K@%#llx:%d",
+	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
+	nvdevs++;
+}
+
+/* ---- the network card ---- */
+
+#define VIRTIO_NET_F_MAC	(1ULL << 5)
+#define NET_HDR_LEN		12	/* struct virtio_net_hdr_v1 */
+#define NET_RXQ			0
+#define NET_TXQ			1
+
+static struct virtio_dev *netdev;
+static volatile bool net_rx_ready;
+
+/* Guest to host: each request is a header and one frame. */
+static void
+net_tx(struct virtio_dev *d)
+{
+	static struct iovec iov[VQ_IOV_MAX];
+	static uint8_t frame[65536];
+	struct virtq *q = &d->vq[NET_TXQ];
+	unsigned int nout;
+	uint16_t head;
+	int n, i;
+
+	while ((n = vq_pop(q, iov, &nout, &head)) > 0) {
+		struct vmpktdesc pkt;
+		struct iovec out;
+		size_t len = 0, skip = NET_HDR_LEN;
+		int count = 1;
+
+		for (i = 0; i < (int)nout; i++) {
+			const uint8_t *p = iov[i].iov_base;
+			size_t l = iov[i].iov_len;
+
+			if (skip >= l) {
+				skip -= l;
+				continue;
+			}
+			p += skip;
+			l -= skip;
+			skip = 0;
+			if (len + l > sizeof(frame))
+				break;
+			memcpy(frame + len, p, l);
+			len += l;
+		}
+		if (len > 0 && len <= d->max_packet) {
+			out.iov_base = frame;
+			out.iov_len = len;
+			memset(&pkt, 0, sizeof(pkt));
+			pkt.vm_pkt_size = len;
+			pkt.vm_pkt_iov = &out;
+			pkt.vm_pkt_iovcnt = 1;
+			(void)vmnet_write(d->iface, &pkt, &count);
+		}
+		vq_push(d, q, head, 0);
+	}
+}
+
+/* Host to guest: as many waiting frames as the guest has buffers for. */
+static void
+net_rx(struct virtio_dev *d)
+{
+	static struct iovec iov[VQ_IOV_MAX];
+	static uint8_t frame[65536];
+	struct virtq *q = &d->vq[NET_RXQ];
+
+	if (!q->ready)
+		return;
+	net_rx_ready = false;
+
+	for (;;) {
+		struct vmpktdesc pkt;
+		struct iovec in;
+		unsigned int nout;
+		uint16_t head, last = q->last_avail;
+		size_t len, done = 0;
+		int count = 1, n, i;
+
+		/* Only read a frame once there is somewhere to put it. */
+		n = vq_pop(q, iov, &nout, &head);
+		if (n <= 0)
+			return;
+
+		in.iov_base = frame + NET_HDR_LEN;
+		in.iov_len = d->max_packet;
+		memset(&pkt, 0, sizeof(pkt));
+		pkt.vm_pkt_size = d->max_packet;
+		pkt.vm_pkt_iov = &in;
+		pkt.vm_pkt_iovcnt = 1;
+		if (vmnet_read(d->iface, &pkt, &count) != VMNET_SUCCESS ||
+		    count < 1) {
+			q->last_avail = last;	/* nothing: put it back */
+			return;
+		}
+
+		memset(frame, 0, NET_HDR_LEN);
+		frame[10] = 1;			/* num_buffers = 1 */
+		len = NET_HDR_LEN + pkt.vm_pkt_size;
+		for (i = (int)nout; i < n && done < len; i++) {
+			size_t l = iov[i].iov_len;
+
+			if (l > len - done)
+				l = len - done;
+			memcpy(iov[i].iov_base, frame + done, l);
+			done += l;
+		}
+		vq_push(d, q, head, (uint32_t)done);
+	}
+}
+
+static void
+net_notify(struct virtio_dev *d, unsigned int qi)
+{
+	if (qi == NET_TXQ)
+		net_tx(d);
+	else
+		net_rx(d);
+}
+
+static void
+net_add(char *cmdline, size_t cmdlen)
+{
+	struct virtio_dev *d = &vdevs[nvdevs];
+	dispatch_queue_t q = dispatch_queue_create("nvmm-run.net", NULL);
+	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+	xpc_object_t desc = xpc_dictionary_create(NULL, NULL, 0);
+	__block vmnet_return_t status = VMNET_FAILURE;
+	static uint8_t mac[6];		/* a block cannot capture an array */
+	__block uint64_t maxpkt = 0;
+
+	xpc_dictionary_set_uint64(desc, vmnet_operation_mode_key,
+	    VMNET_SHARED_MODE);
+	d->iface = vmnet_start_interface(desc, q,
+	    ^(vmnet_return_t st, xpc_object_t params) {
+		status = st;
+		if (st == VMNET_SUCCESS && params != NULL) {
+			const char *m = xpc_dictionary_get_string(params,
+			    vmnet_mac_address_key);
+			unsigned int b[6];
+
+			if (m != NULL && sscanf(m, "%x:%x:%x:%x:%x:%x", &b[0],
+			    &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+				for (int i = 0; i < 6; i++)
+					mac[i] = (uint8_t)b[i];
+			}
+			maxpkt = xpc_dictionary_get_uint64(params,
+			    vmnet_max_packet_size_key);
+		}
+		dispatch_semaphore_signal(sem);
+	});
+	if (d->iface != NULL)
+		dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+	if (d->iface == NULL || status != VMNET_SUCCESS)
+		die("cannot start a vmnet interface (status %d); the network "
+		    "needs root", (int)status);
+
+	/* Frames arrive on vmnet's own thread; the vCPU thread moves them. */
+	vmnet_interface_set_event_callback(d->iface,
+	    VMNET_INTERFACE_PACKETS_AVAILABLE, q,
+	    ^(interface_event_t ev, xpc_object_t params) {
+		(void)ev;
+		(void)params;
+		net_rx_ready = true;
+		pthread_kill(vcpu_thread, SIGUSR1);
+	});
+
+	d->id = VIRTIO_ID_NET;
+	d->irq = 5 + (int)nvdevs;
+	d->features = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC;
+	d->notify = net_notify;
+	d->max_packet = (maxpkt != 0 && maxpkt <= 65536 - NET_HDR_LEN) ?
+	    (size_t)maxpkt : 1514;
+	memcpy(d->config, mac, 6);
+	netdev = d;
+
+	snprintf(cmdline + strlen(cmdline), cmdlen - strlen(cmdline),
+	    " virtio_mmio.device=4K@%#llx:%d",
+	    (unsigned long long)(VIRTIO_BASE + nvdevs * VIRTIO_STRIDE), d->irq);
+	nvdevs++;
+}
+
 /* -------------------------------------------------------------------------- */
 /* I/O ports. */
 
@@ -663,10 +1175,26 @@ io_callback(struct nvmm_io *io)
 		memcpy(io->data, &val, io->size);
 }
 
-/* Nothing lives in memory yet; a later version puts virtio devices here. */
+/* Memory the guest touches that is not RAM: the virtio devices. */
 static void
 mem_callback(struct nvmm_mem *mem)
 {
+	const uint64_t idx = (mem->gpa - VIRTIO_BASE) / VIRTIO_STRIDE;
+	uint32_t v = 0;
+
+	if (mem->gpa >= VIRTIO_BASE && idx < nvdevs && mem->size <= 4) {
+		const uint64_t off = (mem->gpa - VIRTIO_BASE) % VIRTIO_STRIDE;
+
+		if (mem->write) {
+			memcpy(&v, mem->data, mem->size);
+			virtio_write(&vdevs[idx], off, v);
+		} else {
+			v = virtio_read(&vdevs[idx], off, mem->size);
+			memcpy(mem->data, &v, mem->size);
+		}
+		return;
+	}
+
 	if (!mem->write)
 		memset(mem->data, 0xFF, mem->size);
 	if (verbose)
@@ -936,6 +1464,8 @@ idle(void)
 	for (;;) {
 		console_poll();
 		ns = pit_poll();
+		if (net_rx_ready)
+			net_rx(netdev);
 		if (pic_pending() || !running)
 			return;
 		if ((vcpu.exit->exitstate.rflags & 0x200) == 0) {
@@ -962,6 +1492,8 @@ run(void)
 	while (running) {
 		console_poll();
 		(void)pit_poll();
+		if (net_rx_ready)
+			net_rx(netdev);
 		deliver_interrupts();
 
 		if (nvmm_vcpu_run(&mach, &vcpu) == -1) {
@@ -1029,14 +1561,14 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: nvmm-run -k vmlinuz [-i initramfs] "
-	    "[-m megabytes] [-a \"extra cmdline\"] [-v]\n");
+	    "[-d disk.img] [-n] [-m megabytes] [-a \"extra cmdline\"] [-v]\n");
 	exit(2);
 }
 
 int
 main(int argc, char **argv)
 {
-	const char *kpath = NULL, *ipath = NULL, *extra = "";
+	const char *kpath = NULL, *ipath = NULL, *dpath = NULL, *extra = "";
 	struct nvmm_assist_callbacks cbs = { io_callback, mem_callback };
 	struct nvmm_vcpu_conf_cpuid cpuid;
 	struct sigaction sa;
@@ -1045,12 +1577,15 @@ main(int argc, char **argv)
 	size_t len = sizeof(tsc_hz);
 	pthread_t kick;
 	long mb = 512;
+	bool want_net = false;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:m:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:nm:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
+		case 'd': dpath = optarg; break;
+		case 'n': want_net = true; break;
 		case 'm': mb = atol(optarg); break;
 		case 'a': extra = optarg; break;
 		case 'v': verbose = true; break;
@@ -1107,16 +1642,21 @@ main(int argc, char **argv)
 		    sizeof(cmdline) - strlen(cmdline), " tsc_early_khz=%llu",
 		    (unsigned long long)(tsc_hz / 1000));
 	}
+	/* The vmnet callback signals this thread; it must be known first. */
+	vcpu_thread = pthread_self();
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = kick_handler;
+	sigaction(SIGUSR1, &sa, NULL);
+
+	if (dpath != NULL)
+		blk_add(dpath, cmdline, sizeof(cmdline));
+	if (want_net)
+		net_add(cmdline, sizeof(cmdline));
 	snprintf(cmdline + strlen(cmdline), sizeof(cmdline) - strlen(cmdline),
 	    " %s", extra);
 
 	entry = load_linux(kpath, ipath, cmdline);
 	setup_cpu(entry);
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = kick_handler;
-	sigaction(SIGUSR1, &sa, NULL);
-	vcpu_thread = pthread_self();
 
 	console_init();
 	if (pthread_create(&kick, NULL, kicker, NULL) != 0)

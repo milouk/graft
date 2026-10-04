@@ -198,7 +198,7 @@ VMM_TOOL	:= $(BUILD)/nvmm-run
 vmm: $(VMM_TOOL)
 $(VMM_TOOL): vmm/nvmm-run.c $(LIBNVMM)
 	@mkdir -p $(BUILD)
-	$(CC) $(USER_CFLAGS) -o $@ vmm/nvmm-run.c $(LIBNVMM)
+	$(CC) $(USER_CFLAGS) -o $@ vmm/nvmm-run.c $(LIBNVMM) -framework vmnet
 
 # The first real guests. Needs NVMM.kext loaded on an AMD machine.
 GUEST_TOOL	:= $(BUILD)/nvmm-guest-test
