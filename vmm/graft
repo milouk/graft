@@ -27,8 +27,8 @@
 #
 # The VM sees this Mac's home directory, at the same path, so a bind mount
 # of something under it (-v "$PWD:/app") works as it would with containers
-# run here. GRAFT_SHARE names another directory, or nothing if empty. Paths
-# with spaces in them are not handled.
+# run here. GRAFT_SHARE names another directory, or nothing if empty. A path
+# with spaces in it is refused.
 #
 # Ports that containers publish (-p) appear on this Mac too, on the loopback
 # address; set GRAFT_BIND=0.0.0.0 to offer them to the network as
@@ -52,6 +52,16 @@ FLAVOR=containerd
 FLAVOR_SOCKET=
 FLAVOR_CLI=nerdctl
 [ -f "$DIR/flavor.env" ] && . "$DIR/flavor.env"
+
+# The VM mounts the share at the path it has here, so that has to be a whole
+# path, and one the kernel command line can carry.
+if [ -n "$SHARE" ]; then
+	SHARE=$(CDPATH='' cd -- "$SHARE" 2>/dev/null && pwd -P) ||
+	    { echo "GRAFT_SHARE is not a directory: ${GRAFT_SHARE-$HOME}" >&2; exit 1; }
+	case "$SHARE" in
+	*[[:space:]]*) echo "GRAFT_SHARE has a space in it, which is not handled: $SHARE" >&2; exit 1 ;;
+	esac
+fi
 
 vm_pid()  { cat "$DIR/vm.pid" 2>/dev/null || true; }
 net_pid() { cat "$DIR/gvproxy.pid" 2>/dev/null || true; }
@@ -146,7 +156,7 @@ start() {
 	# comes from a pipe, which is how "stop" asks it to shut down.
 	mkfifo "$DIR/console.in"
 	"$GRAFT_RUN" -k "$DIR/vmlinuz-virt" -i "$DIR/initramfs-graft" \
-	    -d "$DIR/root.squashfs" -d "$DIR/data.img" \
+	    -r "$DIR/root.squashfs" -d "$DIR/data.img" \
 	    -n "$DIR/net.sock" -m "$MEM" -c "$CPUS" \
 	    ${SHARE:+-s "$SHARE"} \
 	    -a "$(cat "$DIR/cmdline")${SHARE:+ graft.share=$SHARE}" \

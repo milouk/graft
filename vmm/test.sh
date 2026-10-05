@@ -65,6 +65,8 @@ fi
 # file server and back. Skipped when nothing is shared.
 if [ -n "${GRAFT_SHARE-$HOME}" ]; then
 	T=$(mktemp -d "${GRAFT_SHARE-$HOME}/.graft-test.XXXXXX")
+	trap 'rm -rf "$T"; "$ND" stop > /dev/null 2>&1 || true' EXIT
+	trap 'exit 1' INT TERM
 	echo "from the mac" > "$T/in.txt"
 	dd if=/dev/urandom of="$T/big" bs=1048576 count=64 2> /dev/null
 	bind_mount() {	# bind_mount <runtime command...>

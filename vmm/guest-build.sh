@@ -121,6 +121,12 @@ start() {
 		case "$arg" in
 		graft.share=*)
 			dir=${arg#graft.share=}
+			# Somewhere of its own, never on top of the system.
+			case "$dir" in
+			/|/bin*|/etc*|/lib*|/proc*|/sbin*|/sys*|/usr*|/var*|/dev*|/run*) continue ;;
+			/*) ;;
+			*) continue ;;
+			esac
 			ebegin "Mounting $dir from the host"
 			modprobe -a 9pnet_virtio 9p 2>/dev/null
 			mkdir -p "$dir" && mount -t 9p \

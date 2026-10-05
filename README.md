@@ -179,7 +179,8 @@ files (SSH keys) are satisfied. `GRAFT_SHARE` shares another directory, or
 nothing when empty.
 
 The VM's own root is a compressed read-only image; images, containers and
-volumes live on a separate data disk, which survives replacing it.
+volumes live on a separate data disk. Rebuilding the image, or switching
+runtime, keeps that disk; `RESET_DATA=1` starts it afresh.
 
 ## Container runtimes
 
@@ -262,7 +263,7 @@ With more than one CPU, each gets a local APIC and its own thread, and the
 machine an I/O APIC, described by an MP table.
 
 ```sh
-build/graft-run -k vmlinuz-virt -i initramfs-graft -d root.squashfs -d data.img \
+build/graft-run -k vmlinuz-virt -i initramfs-graft -r root.squashfs -d data.img \
     -c 4 -m 2048 -n /path/to/gvproxy.sock -s "$HOME" -a "$(cat cmdline)"
 ```
 

@@ -28,6 +28,8 @@
  *   graft-run -k vmlinuz [-i initramfs] [-d disk.img]... [-n vmnet|socket]
  *            [-s directory] [-c cpus] [-m megabytes] [-a "extra cmdline"]
  *
+ * -r in place of -d gives a disk the guest cannot write to.
+ *
  * The console is this terminal. Ctrl-A then x quits.
  */
 
@@ -945,6 +947,7 @@ virtio_write(struct virtio_dev *d, uint64_t off, uint32_t v)
 /* ---- the block device ---- */
 
 #define VIRTIO_BLK_F_SEG_MAX	(1ULL << 2)
+#define VIRTIO_BLK_F_RO		(1ULL << 5)
 #define VIRTIO_BLK_F_FLUSH	(1ULL << 9)
 #define BLK_SEG_MAX		126
 
@@ -1083,14 +1086,18 @@ blk_worker(void *arg)
 
 /* Returns the kernel command line fragment that announces the device. */
 static void
-blk_add(const char *path, char *cmdline, size_t cmdlen)
+blk_add(const char *path, bool readonly, char *cmdline, size_t cmdlen)
 {
 	struct virtio_dev *d = &vdevs[nvdevs];
 	struct stat st;
 	uint64_t sectors;
 	uint32_t seg_max = BLK_SEG_MAX;
 
-	d->fd = open(path, O_RDWR);
+	/*
+	 * A read-only disk is opened that way too: what the guest is told
+	 * is advice, and its root can write to the device regardless.
+	 */
+	d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
 	if (d->fd == -1 || fstat(d->fd, &st) == -1)
 		die("%s: %s", path, strerror(errno));
 	sectors = (uint64_t)st.st_size / 512;
@@ -1098,7 +1105,7 @@ blk_add(const char *path, char *cmdline, size_t cmdlen)
 	d->id = VIRTIO_ID_BLOCK;
 	d->irq = virtio_irqs[nvdevs];
 	d->features = VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX |
-	    VIRTIO_BLK_F_FLUSH;
+	    VIRTIO_BLK_F_FLUSH | (readonly ? VIRTIO_BLK_F_RO : 0);
 	d->notify = blk_notify;
 	memcpy(d->config, &sectors, 8);
 	memcpy(d->config + 12, &seg_max, 4);
@@ -2834,7 +2841,7 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: graft-run -k vmlinuz [-i initramfs] "
-	    "[-d disk.img]... [-n vmnet|socket]\n"
+	    "[-d disk.img | -r read-only.img]... [-n vmnet|socket]\n"
 	    "                 [-s directory] [-c cpus] [-m megabytes] "
 	    "[-a \"extra cmdline\"] [-v]\n");
 	exit(2);
@@ -2845,6 +2852,7 @@ main(int argc, char **argv)
 {
 	const char *kpath = NULL, *ipath = NULL, *extra = "";
 	const char *dpaths[VIRTIO_MAXDEV], *share = NULL;
+	bool dreadonly[VIRTIO_MAXDEV];
 	unsigned int ndisks = 0;
 	const char *net = NULL;
 	struct nvmm_assist_callbacks cbs = { io_callback, mem_callback };
@@ -2858,13 +2866,15 @@ main(int argc, char **argv)
 	long mb = 512, n = 1;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "k:i:d:n:s:c:m:a:v")) != -1) {
+	while ((ch = getopt(argc, argv, "k:i:d:r:n:s:c:m:a:v")) != -1) {
 		switch (ch) {
 		case 'k': kpath = optarg; break;
 		case 'i': ipath = optarg; break;
 		case 'd':
+		case 'r':
 			if (ndisks == VIRTIO_MAXDEV - 2)
 				usage();
+			dreadonly[ndisks] = (ch == 'r');
 			dpaths[ndisks++] = optarg;
 			break;
 		case 'n': net = optarg; break;
@@ -2951,7 +2961,7 @@ main(int argc, char **argv)
 
 	/* In the order given: the first is /dev/vda, the next /dev/vdb. */
 	for (i = 0; i < ndisks; i++)
-		blk_add(dpaths[i], cmdline, sizeof(cmdline));
+		blk_add(dpaths[i], dreadonly[i], cmdline, sizeof(cmdline));
 	if (net != NULL && strcmp(net, "vmnet") == 0)
 		net_add_vmnet(cmdline, sizeof(cmdline));
 	else if (net != NULL && strcmp(net, "unplugged") == 0)
@@ -2962,6 +2972,9 @@ main(int argc, char **argv)
 		share_add(share, cmdline, sizeof(cmdline));
 	snprintf(cmdline + strlen(cmdline), sizeof(cmdline) - strlen(cmdline),
 	    " %s", extra);
+	/* Full to the last byte means something was cut off the end. */
+	if (strlen(cmdline) >= sizeof(cmdline) - 1)
+		die("kernel command line too long");
 
 	entry = load_linux(kpath, ipath, cmdline);
 	if (apic_mode)

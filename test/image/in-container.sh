@@ -38,33 +38,38 @@ cc -O2 -Wall -Wextra -Werror -I/work/vmm -o /tmp/p9-serve \
 /tmp/p9-serve 5640 /share &
 SPID=$!
 
-echo "== boot"
-qemu-system-x86_64 -accel tcg -M q35 -m 1G -smp 2 -display none -monitor none \
-    -serial "file:$OUT/console.log" -kernel /dl/vmlinuz-virt \
-    -initrd "$OUT/initramfs-graft" \
-    -append "console=ttyS0 $(cat "$OUT/cmdline") graft.share=/qshare" \
-    -virtfs local,path=/qshare,mount_tag=share0,security_model=none \
-    -drive "file=$OUT/root.squashfs,if=virtio,format=raw,readonly=on" \
-    -drive "file=$OUT/data.img,if=virtio,format=raw" \
-    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 \
-    -device virtio-net-pci,netdev=n0 &
-QPID=$!
-trap 'kill $QPID $SPID 2>/dev/null || true' EXIT
-
+boot_vm() {
+	qemu-system-x86_64 -accel tcg -M q35 -m 1G -smp 2 -display none \
+	    -monitor none -serial "file:$OUT/console.log" \
+	    -kernel /dl/vmlinuz-virt -initrd "$OUT/initramfs-graft" \
+	    -append "console=ttyS0 $(cat "$OUT/cmdline") graft.share=/qshare" \
+	    -virtfs local,path=/qshare,mount_tag=share0,security_model=none \
+	    -drive "file=$OUT/root.squashfs,if=virtio,format=raw,readonly=on" \
+	    -drive "file=$OUT/data.img,if=virtio,format=raw" \
+	    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 \
+	    -device virtio-net-pci,netdev=n0 &
+	QPID=$!
+}
 vm() {
 	ssh -q -i "$KEY" -p 2222 -o StrictHostKeyChecking=no \
 	    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@127.0.0.1 "$@"
 }
-i=0
-until vm true 2>/dev/null; do
-	i=$((i + 1))
-	if [ $i -gt 90 ] || ! kill -0 $QPID 2>/dev/null; then
-		tail -20 "$OUT/console.log"
-		echo "IMAGE TEST FAILED: the VM did not come up"
-		exit 1
-	fi
-	sleep 2
-done
+wait_vm() {
+	i=0
+	until vm true 2>/dev/null; do
+		i=$((i + 1))
+		if [ $i -gt 90 ] || ! kill -0 $QPID 2>/dev/null; then
+			tail -20 "$OUT/console.log"
+			return 1
+		fi
+		sleep 2
+	done
+}
+
+echo "== boot"
+boot_vm
+trap 'kill $QPID $SPID 2>/dev/null || true' EXIT
+wait_vm || { echo "IMAGE TEST FAILED: the VM did not come up"; exit 1; }
 echo "up after about $((i * 2))s"
 
 fail=0
@@ -106,8 +111,8 @@ big_write() {
 	[ -n "$sum" ] && [ "$sum" = "$(sha256sum < /share/big2)" ]
 }
 check "a large file writes intact" big_write
-check "a tree copies in and compares equal" vm "set -ex; mkdir /share/t; cp -r /etc/init.d /etc/ssh /etc/apk /share/t; for d in init.d ssh apk; do diff -r /etc/\$d /share/t/\$d; done; rm -r /share/t; ! test -e /share/t"
-check "rename, hard link, symbolic link" vm "set -ex; cd /share; echo a > f1; mv f1 f2; ! test -e f1; ln f2 f3; ln -s f2 f4; [ \"\$(cat f4)\" = a ]; [ \"\$(readlink f4)\" = f2 ]; echo b >> f2; [ \"\$(wc -l < f3)\" = 2 ]; rm f2 f3 f4"
+check "a tree copies in and compares equal" vm "set -ex; mkdir /share/t; cp -r /etc/init.d /etc/ssh /etc/apk /share/t; for d in init.d ssh apk; do diff -r /etc/\$d /share/t/\$d; done; rm -r /share/t; if test -e /share/t; then exit 1; fi"
+check "rename, hard link, symbolic link" vm "set -ex; cd /share; echo a > f1; mv f1 f2; if test -e f1; then exit 1; fi; ln f2 f3; ln -s f2 f4; [ \"\$(cat f4)\" = a ]; [ \"\$(readlink f4)\" = f2 ]; echo b >> f2; [ \"\$(wc -l < f3)\" = 2 ]; rm f2 f3 f4"
 check "mode, truncation, times" vm "set -ex; cd /share; echo a > m; chmod 755 m; [ \"\$(stat -c %a m)\" = 755 ]; chmod 600 m; [ \"\$(stat -c %a m)\" = 600 ]; : > m; [ ! -s m ]; touch -d '2020-01-02 03:04:05' m; [ \"\$(stat -c %Y m)\" = \"\$(date -d '2020-01-02 03:04:05' +%s)\" ]; mkdir -m 750 md; [ \"\$(stat -c %a md)\" = 777 ]; rmdir md; rm m"
 check "a program runs from it" vm "set -ex; cp /bin/busybox /share/true; /share/true; rm /share/true"
 if [ -n "$FLAVOR_CLI" ]; then
@@ -121,9 +126,24 @@ if [ -n "$FLAVOR_CLI" ]; then
 fi
 echo "-- in the VM:"
 vm "free -m | sed -n 2p; df -m / /var/lib | tail -2; dmesg | grep -i -c -E 'error|fail' || true"
+check "the data disk is what /var/lib is" vm "mount | grep -q '/dev/vdb on /var/lib'"
+check "the root disk cannot be written" vm "! dd if=/dev/zero of=/dev/vda bs=512 count=1 2>/dev/null"
+
 # What is written under /var/lib must still be there after a restart; the
 # rest of the root must not be.
-check "the data disk is what /var/lib is" vm "mount | grep -q '/dev/vdb on /var/lib'"
+vm "touch /var/lib/graft-kept /etc/graft-lost; sync"
+vm poweroff 2>/dev/null || true
+i=0
+while kill -0 $QPID 2>/dev/null && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done
+kill $QPID 2>/dev/null || true
+boot_vm
+if wait_vm; then
+	check "the data disk keeps what was written" vm "test -e /var/lib/graft-kept"
+	check "the root forgets what was written" vm "if test -e /etc/graft-lost; then exit 1; fi"
+else
+	echo "FAIL  the VM comes up a second time"
+	fail=1
+fi
 vm poweroff 2>/dev/null || true
 i=0
 while kill -0 $QPID 2>/dev/null && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done

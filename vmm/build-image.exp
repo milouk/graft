@@ -26,6 +26,12 @@
 #   IMAGES  container images to pull into data.img as it is built, so that
 #           they are there without a network. None by default.
 #   SIZE    the size of data.img (default 8G; it only takes the space used).
+#   RESET_DATA  set to 1 to replace a data.img that is already there.
+#
+# A data.img already in the output directory is kept: it holds the images,
+# containers and volumes, and rebuilding the root, or changing runtime, is no
+# reason to lose them. The rest is replaced, and only once the build has
+# succeeded.
 #
 # The Alpine release in guest-build.sh must match the ISO, whose kernel
 # modules the image uses, and graft-run must boot that same kernel: the
@@ -53,6 +59,7 @@ set here [file dirname [file normalize [info script]]]
 set data $outdir/data.img
 set rootfs $outdir/root.squashfs
 set initramfs $outdir/initramfs-graft
+set work $outdir/build-data.img
 set script $outdir/build-script.img
 set scratch $outdir/build-scratch.img
 set sock $outdir/build-serial.sock
@@ -65,12 +72,21 @@ if {![file exists $ffile]} {
     puts "### no such flavor: $flavor (see [file join $here flavors])"
     exit 2
 }
+set images ""
+if {[info exists env(IMAGES)]} { set images $env(IMAGES) }
+set keepdata [expr {[file exists $data] &&
+    !([info exists env(RESET_DATA)] && $env(RESET_DATA) eq "1")}]
+if {$keepdata && $images ne ""} {
+    puts "### IMAGES are pulled into a new data.img, and $data exists."
+    puts "### Set RESET_DATA=1 to replace it, or pull them in the running VM."
+    exit 2
+}
 file mkdir $outdir
-file delete -force $sock $rootfs $data $script $scratch
+file delete -force $sock $work $script $scratch
 
 # The first disk is where the tree is put together; it ends up as the data
 # disk. The scratch disk carries the initramfs and the squashfs out.
-exec $qimg create -f raw $data $size
+exec $qimg create -f raw $work $size
 exec $qimg create -f raw $scratch 1G
 # A key pair for the host to reach the VM with. Kept if it is already there,
 # so that rebuilding the image does not lock out a running setup's key.
@@ -84,8 +100,6 @@ close $fh
 
 # The script, with the public key in front of it, padded to a whole number
 # of sectors with newlines.
-set images ""
-if {[info exists env(IMAGES)]} { set images $env(IMAGES) }
 exec sh -c "printf 'PUBKEY=\"%s\"\nIMAGES=\"%s\"\n' '$pubkey' '$images' > '$script'; \
     cat '$ffile' '$here/guest-build.sh' >> '$script'; \
     n=\$(wc -c < '$script'); pad=\$(( (512 - n % 512) % 512 + 512 )); \
@@ -93,7 +107,7 @@ exec sh -c "printf 'PUBKEY=\"%s\"\nIMAGES=\"%s\"\n' '$pubkey' '$images' > '$scri
 
 set qpid [exec $qemu -accel $accel -M q35 -m 2G -display none \
     -monitor none -serial unix:$sock,server=on,wait=off -cdrom $iso \
-    -drive file=$data,if=virtio,format=raw \
+    -drive file=$work,if=virtio,format=raw \
     -drive file=$script,if=virtio,format=raw,readonly=on \
     -drive file=$scratch,if=virtio,format=raw \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
@@ -142,9 +156,24 @@ expect eof
 for {set i 0} {$i < 100 && ![catch {exec kill -0 $qpid}]} {incr i} { after 200 }
 
 if {$isize <= 0 || $ssize <= 0} { puts "### sizes not reported"; exit 1 }
-exec head -c $isize $scratch > $initramfs
+# Under other names first, so that what was there stays whole until all of
+# the new image is.
+exec head -c $isize $scratch > $initramfs.new
 # The squashfs starts SQUASHFS_AT megabytes in; see guest-build.sh.
-exec sh -c "dd if='$scratch' bs=1048576 skip=64 2>/dev/null | head -c $ssize > '$rootfs'"
+exec sh -c "dd if='$scratch' bs=1048576 skip=64 2>/dev/null | head -c $ssize > '$rootfs.new'"
+if {[file size $initramfs.new] != $isize || [file size $rootfs.new] != $ssize} {
+    puts "### the image did not come out of the build whole"
+    exit 1
+}
+file rename -force $initramfs.new $initramfs
+file rename -force $rootfs.new $rootfs
+if {$keepdata} {
+    file delete -force $work
+    set datanote "$data kept as it was"
+} else {
+    file rename -force $work $data
+    set datanote "a new $data"
+}
 # What the kernel has to be told to boot this image.
 set fh [open $outdir/cmdline w]
 puts $fh "root=/dev/vda rootfstype=squashfs overlaytmpfs=yes modules=squashfs,overlay,ext4 quiet"
@@ -153,4 +182,4 @@ file delete -force $script $scratch $sock
 # What graft needs to know about the image, in a form it can source.
 exec sh -c ". '$ffile'; printf 'FLAVOR=%s\nFLAVOR_SOCKET=%s\nFLAVOR_CLI=%s\n' \
     '$flavor' \"\$FLAVOR_SOCKET\" \"\$FLAVOR_CLI\" > '$outdir/flavor.env'"
-puts "\n### built $rootfs ($flavor, $ssize bytes), $data and $initramfs; key in $key"
+puts "\n### built $rootfs ($flavor, $ssize bytes) and $initramfs; $datanote; key in $key"
