@@ -413,7 +413,11 @@ darwin_nvmm_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag __unused,
 	return nvmm_ioctl(owner, cmd, data);
 }
 
-static const struct cdevsw nvmm_cdevsw = {
+/*
+ * Not const: SDKs before macOS 11 declare cdevsw_add() and cdevsw_remove()
+ * as taking a pointer they could write through, though they do not.
+ */
+static struct cdevsw nvmm_cdevsw = {
 	.d_open = darwin_nvmm_open,
 	.d_close = darwin_nvmm_close,
 	.d_read = eno_rdwrt,
