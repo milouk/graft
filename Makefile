@@ -72,6 +72,10 @@ test-bare: bare
 
 # ------------------------------------------------------- macOS kernel extension
 SDK		?= $(shell ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX15*.sdk 2>/dev/null | tail -1)
+# No such SDK, on an older or a newer system: whichever one is the default.
+ifeq ($(SDK),)
+SDK		:= $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
+endif
 KHDR		:= $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 KEXT_DIR	:= $(BUILD)/kext
 KEXT_BUNDLE	:= $(BUILD)/NVMM.kext
