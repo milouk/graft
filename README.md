@@ -156,6 +156,15 @@ vmm/graft stop
 
 `GRAFT_CPUS` and `GRAFT_MEM` size the VM.
 
+To have the driver loaded at boot and the VM started at login:
+
+```sh
+sudo tools/install-autostart.sh
+```
+
+The first time, macOS asks for the driver to be approved in System Settings.
+The VM's size is then read from `~/.graft/vm.env` at each start.
+
 ### Files
 
 Your home directory is visible in the VM at the same path, so a bind mount
