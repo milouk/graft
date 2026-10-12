@@ -71,11 +71,19 @@
 #define CMDLINE_MAX	2048
 #define LOWMEM_END	0x0009FC00ULL
 #define HIGHMEM_START	0x00100000ULL
-#define MEM_MAX_MB	3072		/* stay below the device hole */
+/*
+ * Devices live between 3G and 4G, so guest RAM is in two pieces: what fits
+ * below 3G, and the rest from 4G up. On the host it is one block; the second
+ * piece follows the first.
+ */
+#define RAM_LOW_MAX	0xC0000000ULL
+#define RAM_HIGH_BASE	0x100000000ULL
+#define MEM_MAX_MB	(64 * 1024)
 
 static struct nvmm_machine mach;
 static uint8_t *ram;
-static uint64_t ram_size;
+static uint64_t ram_size;	/* all of it */
+static uint64_t ram_low;	/* the piece below the devices */
 
 /*
  * One of these per virtual CPU. Everything in this file that is not marked
@@ -776,9 +784,20 @@ static const int virtio_irqs[VIRTIO_MAXDEV] = { 5, 6, 7, 10, 11, 12 };
 static void *
 gpa_ptr(uint64_t gpa, uint64_t len)
 {
-	if (gpa >= ram_size || len > ram_size - gpa)
-		return NULL;
-	return ram + gpa;
+	if (gpa < ram_low) {
+		if (len > ram_low - gpa)
+			return NULL;
+		return ram + gpa;
+	}
+	if (gpa >= RAM_HIGH_BASE) {
+		const uint64_t off = gpa - RAM_HIGH_BASE;
+		const uint64_t high = ram_size - ram_low;
+
+		if (off >= high || len > high - off)
+			return NULL;
+		return ram + ram_low + off;
+	}
+	return NULL;
 }
 
 struct vq_desc {
@@ -2310,7 +2329,7 @@ load_linux(const char *kpath, const char *ipath, const char *cmdline)
 	setup_size = (setup_sects + 1) * 512;
 	load = rd64(kernel, 0x258);		/* the address it prefers */
 	init_size = rd32(kernel, 0x260);
-	if (load < HIGHMEM_START || load + init_size > ram_size)
+	if (load < HIGHMEM_START || load + init_size > ram_low)
 		die("kernel wants %llu MB at %#llx; guest has %llu MB",
 		    (unsigned long long)(init_size >> 20),
 		    (unsigned long long)load,
@@ -2331,9 +2350,10 @@ load_linux(const char *kpath, const char *ipath, const char *cmdline)
 
 	if (ipath != NULL) {
 		initrd = read_file(ipath, &isize);
-		if (isize >= ram_size)
+		/* Below 4G: the protocol gives its address 32 bits. */
+		if (isize >= ram_low)
 			die("initramfs does not fit in guest memory");
-		initrd_gpa = (ram_size - isize) & ~0xFFFULL;
+		initrd_gpa = (ram_low - isize) & ~0xFFFULL;
 		if (initrd_gpa < load + init_size)
 			die("initramfs does not fit in guest memory");
 		memcpy(ram + initrd_gpa, initrd, isize);
@@ -2344,7 +2364,9 @@ load_linux(const char *kpath, const char *ipath, const char *cmdline)
 
 	e820_add(bp, 0, LOWMEM_END, 1);
 	e820_add(bp, LOWMEM_END, HIGHMEM_START - LOWMEM_END, 2);
-	e820_add(bp, HIGHMEM_START, ram_size - HIGHMEM_START, 1);
+	e820_add(bp, HIGHMEM_START, ram_low - HIGHMEM_START, 1);
+	if (ram_size > ram_low)
+		e820_add(bp, RAM_HIGH_BASE, ram_size - ram_low, 1);
 
 	free(kernel);
 	return load + 0x200;			/* startup_64 */
@@ -2890,6 +2912,7 @@ main(int argc, char **argv)
 	    n > MAX_CPUS)
 		usage();
 	ram_size = (uint64_t)mb << 20;
+	ram_low = ram_size < RAM_LOW_MAX ? ram_size : RAM_LOW_MAX;
 	ncpus = (unsigned int)n;
 	apic_mode = ncpus > 1;
 
@@ -2931,12 +2954,23 @@ main(int argc, char **argv)
 	    MAP_ANON | MAP_PRIVATE, -1, 0);
 	if (ram == MAP_FAILED)
 		die("mmap: %s", strerror(errno));
-	if (nvmm_hva_map(&mach, (uintptr_t)ram, ram_size) == -1)
+	if (nvmm_hva_map(&mach, (uintptr_t)ram, ram_low) == -1)
 		die("cannot get %ld MB of guest memory: %s", mb,
 		    strerror(errno));
-	if (nvmm_gpa_map(&mach, (uintptr_t)ram, 0, ram_size,
+	if (nvmm_gpa_map(&mach, (uintptr_t)ram, 0, ram_low,
 	    PROT_READ | PROT_WRITE | PROT_EXEC) == -1)
 		die("gpa map: %s", strerror(errno));
+	if (ram_size > ram_low) {
+		const uintptr_t high = (uintptr_t)ram + ram_low;
+
+		if (nvmm_hva_map(&mach, high, ram_size - ram_low) == -1)
+			die("cannot get %ld MB of guest memory: %s", mb,
+			    strerror(errno));
+		if (nvmm_gpa_map(&mach, high, RAM_HIGH_BASE,
+		    ram_size - ram_low,
+		    PROT_READ | PROT_WRITE | PROT_EXEC) == -1)
+			die("gpa map above 4G: %s", strerror(errno));
+	}
 
 	/*
 	 * With no ACPI the kernel has little to measure the CPU's clock
